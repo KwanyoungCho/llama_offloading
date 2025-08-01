@@ -735,7 +735,7 @@ public:
 // CRITICAL: Per-thread and per-task-type performance monitoring
 class thread_performance_monitor {
 private:
-    struct thread_metrics {
+struct thread_metrics {
         uint32_t thread_id;
         thread_role role;
         
@@ -746,7 +746,7 @@ private:
         std::atomic<uint64_t> compression_tasks{0};  // Phase 2+
         
         // Timing statistics
-        std::atomic<uint64_t> total_processing_time_us{0};
+    std::atomic<uint64_t> total_processing_time_us{0};
         std::atomic<uint64_t> max_task_latency_us{0};
         std::atomic<uint64_t> min_task_latency_us{UINT64_MAX};
         

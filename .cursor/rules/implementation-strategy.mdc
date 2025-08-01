@@ -10,7 +10,7 @@ description: "Layer-Limited KV Cache SSD Offloading Implementation Strategy and 
 
 ### **Phase 1: Foundation (현재 - Full Copy Strategy) ✅**
 - [x] Producer-Consumer threading system
-- [x] Thread-safe task queue implementation  
+- [x] Thread-safe task queue implementation
 - [x] Worker thread pool management
 - [x] Basic async I/O framework
 - [x] Complete data copying from llama_context

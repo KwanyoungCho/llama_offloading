@@ -118,7 +118,7 @@ int main(int argc, char ** argv) {
     // ADDED: Setup KV offloader and callback BEFORE context creation
     // =============================================================================
     printf("\n[KV-SSD] Initializing KV cache SSD offloading...\n");
-    struct llama_kv_offloader* kv_offloader = llama_kv_offloader_init("~/llama.cpp_test/simple_kv_cache");
+    struct llama_kv_offloader* kv_offloader = llama_kv_offloader_init("./simple_kv_cache");
     if (!kv_offloader) {
         fprintf(stderr, "%s: error: failed to initialize KV offloader\n", __func__);
         llama_model_free(model);
@@ -129,11 +129,9 @@ int main(int argc, char ** argv) {
     // Setup callback data for GGML backend scheduler
     static struct llama_kv_callback_data cb_data = {};
     cb_data.offloader = kv_offloader;
-    cb_data.current_layer = 0;  // Will be extracted from tensor name during callback
-    cb_data.k_cache_data = nullptr;
-    cb_data.v_cache_data = nullptr;
-    cb_data.k_cache_size = 0;
-    cb_data.v_cache_size = 0;
+    cb_data.layer_id = 0;
+    cb_data.k_tensor = nullptr;
+    cb_data.v_tensor = nullptr;
     cb_data.k_cache_ready = false;
     cb_data.v_cache_ready = false;
     

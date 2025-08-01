@@ -35,7 +35,6 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
-
             llama-kv-offloading.cpp
             )
 
@@ -52,9 +51,8 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 # ADDED: GGML Backend Scheduler Callback Test
-add_executable(test-ggml-callback
-    test-ggml-callback.cpp
-    llama-kv-offloading.cpp
-)
-target_include_directories(test-ggml-callback PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(test-ggml-callback PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+# add_executable(test-ggml-callback
+#     test-ggml-callback.cpp
+# )
+# target_include_directories(test-ggml-callback PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# target_link_libraries(test-ggml-callback PRIVATE ${CMAKE_THREAD_LIBS_INIT})

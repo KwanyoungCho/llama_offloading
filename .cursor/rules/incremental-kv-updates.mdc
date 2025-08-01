@@ -145,8 +145,8 @@ namespace phase3_incremental_design {
         
         // Data layout: [header][full_checkpoint][incremental_chunks...]
         // Each chunk can be compressed independently
-    };
-    
+        };
+        
     // Token-level incremental operations
     class incremental_kv_manager {
     private:
@@ -162,8 +162,8 @@ namespace phase3_incremental_design {
             size_t compressed_size;
             void* compressed_data;
         };
-        
-    public:
+    
+public:
         // Append new tokens to layer (most common operation)
         bool append_tokens_to_layer(uint32_t layer_id, uint32_t start_token, 
                                    const kv_data& new_tokens) {
@@ -223,7 +223,7 @@ namespace phase3_incremental_design {
                                        const verification_result& result) {
             for (const auto& acceptance : result.accepted) {
                 commit_speculative_chunk(layer_id, acceptance.candidate_id);
-            }
+        }
             
             for (const auto& rejection : result.rejected) {
                 rollback_speculative_chunk(layer_id, rejection.candidate_id);

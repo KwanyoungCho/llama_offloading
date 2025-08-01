@@ -1328,13 +1328,29 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(k, "k_cache", il);
     cb(v, "v_cache", il);
 
-    // ggml_tensor * k_next = kv_state->get_k(ctx0, il + 1);
-    // ggml_tensor * v_next = kv_state->get_v(ctx0, il + 1);
-
-    // cb(k_next, "k_cache", il + 1);
-    // cb(v_next, "v_cache", il + 1);
-
     ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, kq_scale);
+
+    // kv cache prefetch for next layer (with bounds check)
+    if (il + 1 < hparams.n_layer) {  // 다음 layer가 존재하는지 확인
+        ggml_tensor * k_next = kv_state->get_k(ctx0, il + 1);
+        ggml_tensor * v_next = kv_state->get_v(ctx0, il + 1);
+     
+        ggml_build_forward_expand(gf, k_next);
+        ggml_build_forward_expand(gf, v_next);
+        
+        cb(k_next, "k_cache_next", il + 1);
+        cb(v_next, "v_cache_next", il + 1);
+    } else {
+        ggml_tensor * k_next = kv_state->get_k(ctx0, 0);
+        ggml_tensor * v_next = kv_state->get_v(ctx0, 0);
+
+        ggml_build_forward_expand(gf, k_next);
+        ggml_build_forward_expand(gf, v_next);
+        
+        cb(k_next, "k_cache_next", 0);
+        cb(v_next, "v_cache_next", 0);
+    }
+
     cb(cur, "kqv_out", il);
 
     if (wo) {
