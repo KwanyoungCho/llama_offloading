@@ -1,0 +1,866 @@
+
+---
+globs: "*kv-offloading*,*context*,*thread*"
+description: "Threading patterns and synchronization for layer-limited KV cache offloading"
+---
+
+# Compression-Ready Threading Patterns for KV Cache SSD Offloading
+
+## 🧵 **CORE THREADING ARCHITECTURE (Compression-Extensible)**
+
+### **Producer-Consumer Pattern with Compression Pipeline**
+```
+Main Thread (Producer)           Worker Thread Pool (4-8 Consumers)
+┌─────────────────────┐         ┌─────────────────────────────────┐
+│ Layer Processing    │────────▶│ Thread 0: Copy + Save Worker   │
+│ - Copy layer data   │         │ Thread 1: Copy + Save Worker   │
+│ - Submit save tasks │         │ Thread 2: Load + Decomp Worker │
+│ - Submit load tasks │         │ Thread 3: Load + Decomp Worker │
+└─────────────────────┘         └─────────────────────────────────┘
+         │                                        │
+         │ Full Copy Strategy                     │
+         ▼                                        ▼
+┌─────────────────────┐         ┌─────────────────────────────────┐
+│ Memory Slots (2개)  │◀───────▶│    Thread-Safe Task Queue      │
+│ - Raw data (Phase1) │         │ - Copy tasks                   │
+│ - Compressed data   │         │ - Save tasks (raw/compressed)  │
+│   (Phase 2+)        │         │ - Load tasks (raw/compressed)  │
+└─────────────────────┘         └─────────────────────────────────┘
+                                               │
+                                               ▼
+                                     ┌─────────────────┐
+                                     │   SSD Storage   │
+                                     │ Raw/Compressed  │
+                                     │   Layer Files   │
+                                     └─────────────────┘
+```
+
+### **Thread Pool Design (Compression-Aware)**
+```cpp
+// CRITICAL: Thread pool designed for compression workloads
+class compression_ready_thread_pool {
+private:
+    // Phase 1: Basic thread allocation
+    uint32_t num_threads = 4;
+    std::vector<std::thread> worker_threads;
+    
+    // Phase 2+: Specialized thread roles
+    enum thread_role {
+        COPY_SAVE_WORKER,      // Memory copy + save operations
+        LOAD_DECOMP_WORKER,    // Load + decompression operations
+        COMPRESSION_WORKER,    // Pure compression tasks (Phase 2+)
+        GENERAL_WORKER         // Fallback for any task type
+    };
+    
+    struct worker_config {
+        thread_role role;
+        uint32_t thread_id;
+        std::atomic<uint64_t> tasks_completed{0};
+        std::atomic<uint64_t> total_processing_time_us{0};
+    };
+    
+    std::vector<worker_config> worker_configs;
+    
+    // Thread-safe task distribution
+    std::queue<kv_task> task_queue;
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    std::atomic<bool> shutdown_flag{false};
+    
+public:
+    void initialize_compression_ready_pool() {
+        // Phase 1: Simple round-robin workers
+        for (uint32_t i = 0; i < num_threads; ++i) {
+            worker_configs[i] = {GENERAL_WORKER, i, 0, 0};
+            worker_threads.emplace_back(&compression_ready_thread_pool::worker_main, this, i);
+        }
+        
+        // Phase 2+: Will specialize worker roles
+        // assign_specialized_roles();
+    }
+    
+    void worker_main(uint32_t worker_id) {
+        worker_config& config = worker_configs[worker_id];
+        
+        while (!shutdown_flag.load()) {
+            kv_task task;
+            
+            // Get next task from queue
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                queue_cv.wait(lock, [this] { 
+                    return !task_queue.empty() || shutdown_flag.load(); 
+                });
+                
+                if (shutdown_flag.load() && task_queue.empty()) {
+                    break;
+                }
+                
+                task = task_queue.front();
+                task_queue.pop();
+            }
+            
+            // Execute task based on type and worker specialization
+            auto start_time = std::chrono::steady_clock::now();
+            
+            bool success = execute_task_by_type(task, config);
+            
+            auto end_time = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+            
+            // Update worker statistics
+            config.tasks_completed.fetch_add(1);
+            config.total_processing_time_us.fetch_add(duration.count());
+            
+            // Update global counters
+            update_completion_counters(task.type, success);
+        }
+    }
+    
+private:
+    bool execute_task_by_type(const kv_task& task, const worker_config& config) {
+        switch (task.type) {
+            case KV_TASK_COPY_LAYER:
+                return execute_copy_task(task);
+            
+            case KV_TASK_SAVE_LAYER:
+                // Phase 1: Raw save
+                return execute_save_task_raw(task);
+                // Phase 2+: Compression-aware save
+                // return execute_save_task_compressed(task);
+            
+            case KV_TASK_LOAD_LAYER:
+                // Phase 1: Raw load
+                return execute_load_task_raw(task);
+                // Phase 2+: Decompression-aware load
+                // return execute_load_task_decompressed(task);
+                
+            case KV_TASK_COMPRESS_LAYER:
+                // Phase 2+: Pure compression task
+                return execute_compression_task(task);
+                
+            default:
+                return false;
+        }
+    }
+};
+```
+
+## 🚀 **TASK TYPES & QUEUE MANAGEMENT (Extended)**
+
+### **Enhanced Task Definition**
+```cpp
+// CRITICAL: Task types supporting compression pipeline
+enum kv_task_type {
+    // Phase 1: Basic operations
+    KV_TASK_COPY_LAYER = 1,      // Copy layer data from llama_context
+    KV_TASK_SAVE_LAYER = 2,      // Save layer to SSD (raw or compressed)
+    KV_TASK_LOAD_LAYER = 3,      // Load layer from SSD (raw or compressed)
+    
+    // Phase 2: Compression operations
+    KV_TASK_COMPRESS_LAYER = 4,   // Compress layer data in memory slot
+    KV_TASK_DECOMPRESS_LAYER = 5, // Decompress loaded layer data
+    
+    // Phase 3: Advanced operations
+    KV_TASK_ADAPTIVE_SAVE = 6,    // Smart save (choose compression method)
+    KV_TASK_PREFETCH_BATCH = 7,   // Batch prefetch multiple layers
+    KV_TASK_MEMORY_COMPACT = 8    // Memory slot compaction/defragmentation
+};
+
+struct compression_aware_task {
+    kv_task_type type;
+    struct llama_context* ctx;
+    uint32_t layer_id;
+    
+    // Phase 1: Basic parameters
+    uint32_t priority = 0;        // Task priority (0 = highest)
+    
+    // Phase 2: Compression parameters
+    compression_method_t compression_method = COMPRESSION_NONE;
+    float compression_threshold = 0.7f;  // Minimum compression ratio
+    bool force_compression = false;      // Override threshold check
+    
+    // Phase 3: Advanced parameters
+    std::vector<uint32_t> batch_layers;  // For batch operations
+    memory_pressure_hint pressure_hint = NORMAL; // Memory management hint
+    
+    // Completion tracking
+    std::promise<bool> completion_promise;
+    std::shared_ptr<std::atomic<bool>> completion_flag;
+    
+    compression_aware_task(kv_task_type t, llama_context* c, uint32_t lid) 
+        : type(t), ctx(c), layer_id(lid), 
+          completion_flag(std::make_shared<std::atomic<bool>>(false)) {}
+};
+```
+
+### **Intelligent Task Queue Management**
+```cpp
+// CRITICAL: Priority-aware queue supporting compression workloads
+class compression_aware_task_queue {
+private:
+    // Multi-priority queues
+    std::priority_queue<compression_aware_task, 
+                       std::vector<compression_aware_task>,
+                       task_priority_comparator> high_priority_queue;
+    std::queue<compression_aware_task> normal_priority_queue;
+    std::queue<compression_aware_task> low_priority_queue;
+    
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    
+    // Queue statistics
+    std::atomic<uint32_t> pending_copy_tasks{0};
+    std::atomic<uint32_t> pending_save_tasks{0};
+    std::atomic<uint32_t> pending_load_tasks{0};
+    std::atomic<uint32_t> pending_compression_tasks{0};  // Phase 2+
+    
+public:
+    void submit_task(compression_aware_task&& task) {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        
+        // Update pending counters
+        increment_pending_counter(task.type);
+        
+        // Queue based on priority and type
+        if (task.priority == 0) {
+            high_priority_queue.push(std::move(task));
+        } else if (is_compression_task(task.type)) {
+            // Phase 2+: Compression tasks get medium priority
+            normal_priority_queue.push(std::move(task));
+        } else {
+            low_priority_queue.push(std::move(task));
+        }
+        
+        queue_cv.notify_one();
+    }
+    
+    bool get_next_task(compression_aware_task& task) {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        
+        queue_cv.wait(lock, [this] {
+            return !all_queues_empty() || shutdown_requested();
+        });
+        
+        if (shutdown_requested() && all_queues_empty()) {
+            return false;
+        }
+        
+        // Priority order: high -> normal -> low
+        if (!high_priority_queue.empty()) {
+            task = std::move(const_cast<compression_aware_task&>(high_priority_queue.top()));
+            high_priority_queue.pop();
+        } else if (!normal_priority_queue.empty()) {
+            task = std::move(normal_priority_queue.front());
+            normal_priority_queue.pop();
+        } else if (!low_priority_queue.empty()) {
+            task = std::move(low_priority_queue.front());
+            low_priority_queue.pop();
+        } else {
+            return false;
+        }
+        
+        // Update pending counters
+        decrement_pending_counter(task.type);
+        return true;
+    }
+    
+private:
+    void increment_pending_counter(kv_task_type type) {
+        switch (type) {
+            case KV_TASK_COPY_LAYER:
+                pending_copy_tasks.fetch_add(1);
+                break;
+            case KV_TASK_SAVE_LAYER:
+                pending_save_tasks.fetch_add(1);
+                break;
+            case KV_TASK_LOAD_LAYER:
+                pending_load_tasks.fetch_add(1);
+                break;
+            case KV_TASK_COMPRESS_LAYER:
+            case KV_TASK_DECOMPRESS_LAYER:
+                pending_compression_tasks.fetch_add(1);  // Phase 2+
+                break;
+        }
+    }
+    
+    bool is_compression_task(kv_task_type type) const {
+        return type == KV_TASK_COMPRESS_LAYER || 
+               type == KV_TASK_DECOMPRESS_LAYER ||
+               type == KV_TASK_ADAPTIVE_SAVE;  // Phase 2+
+    }
+};
+```
+
+## 🔄 **SYNCHRONIZATION PATTERNS (Compression-Enhanced)**
+
+### **Multi-Level Synchronization Strategy**
+```cpp
+// CRITICAL: Hierarchical locking for compression operations
+class compression_sync_manager {
+private:
+    // Level 1: Global offloader state
+    std::shared_mutex offloader_state_mutex;
+    
+    // Level 2: Memory slots (read-write access)
+    std::shared_mutex slots_mutex;
+    
+    // Level 3: Individual slot data (fine-grained)
+    // Each memory_slot has its own slot_mutex
+    
+    // Level 4: Task queue operations
+    std::mutex task_queue_mutex;
+    std::condition_variable task_queue_cv;
+    
+    // Level 5: Compression algorithm access (Phase 2+)
+    std::shared_mutex compression_algorithms_mutex;
+    
+    // Completion synchronization
+    std::mutex completion_mutex;
+    std::condition_variable completion_cv;
+    
+public:
+    // RULE: Lock order must be: offloader -> slots -> individual_slot -> queue
+    void safe_layer_transition(uint32_t from_layer, uint32_t to_layer) {
+        // Level 1: Reader lock on offloader state
+        std::shared_lock<std::shared_mutex> offloader_lock(offloader_state_mutex);
+        
+        // Level 2: Writer lock on slots for modification
+        std::unique_lock<std::shared_mutex> slots_lock(slots_mutex);
+        
+        // Find target slots
+        memory_slot* current_slot = find_slot_by_layer_id(to_layer);
+        memory_slot* previous_slot = find_slot_by_layer_id(from_layer);
+        
+        // Level 3: Lock individual slots in consistent order (by layer_id)
+        std::vector<std::unique_lock<std::mutex>> slot_locks;
+        if (current_slot && previous_slot) {
+            if (current_slot->layer_id < previous_slot->layer_id) {
+                slot_locks.emplace_back(current_slot->slot_mutex);
+                slot_locks.emplace_back(previous_slot->slot_mutex);
+            } else {
+                slot_locks.emplace_back(previous_slot->slot_mutex);
+                slot_locks.emplace_back(current_slot->slot_mutex);
+            }
+        } else if (current_slot) {
+            slot_locks.emplace_back(current_slot->slot_mutex);
+        } else if (previous_slot) {
+            slot_locks.emplace_back(previous_slot->slot_mutex);
+        }
+        
+        // Perform layer transition operations
+        execute_layer_transition(from_layer, to_layer, current_slot, previous_slot);
+    }
+    
+    // RULE: Compression operations need algorithm lock
+    bool compress_slot_data(memory_slot* slot, compression_method_t method) {
+        // Phase 2+: Reader lock on compression algorithms
+        std::shared_lock<std::shared_mutex> algo_lock(compression_algorithms_mutex);
+        
+        // Slot must already be locked by caller
+        assert(slot != nullptr);
+        
+        // Get compression algorithm
+        auto* compressor = get_compression_algorithm(method);
+        if (!compressor) {
+            return false;
+        }
+        
+        // Perform compression (no additional locks needed)
+        return apply_compression(slot, compressor);
+    }
+};
+```
+
+### **Deadlock Prevention Strategy**
+```cpp
+// CRITICAL: Consistent lock ordering prevents deadlocks
+class deadlock_prevention {
+public:
+    // RULE 1: Global lock hierarchy (must be followed everywhere)
+    enum lock_level {
+        LEVEL_1_OFFLOADER = 1,     // Global offloader state
+        LEVEL_2_SLOTS = 2,         // Memory slots collection
+        LEVEL_3_INDIVIDUAL = 3,    // Individual slot
+        LEVEL_4_QUEUE = 4,         // Task queue
+        LEVEL_5_COMPRESSION = 5,   // Compression algorithms (Phase 2+)
+        LEVEL_6_COMPLETION = 6     // Completion synchronization
+    };
+    
+    // RULE 2: Multiple locks at same level must be ordered by ID
+    template<typename Lockable>
+    static void lock_multiple_ordered(std::vector<Lockable*>& lockables) {
+        std::sort(lockables.begin(), lockables.end(), 
+                 [](const Lockable* a, const Lockable* b) {
+                     return std::addressof(*a) < std::addressof(*b);
+                 });
+        
+        for (auto* lockable : lockables) {
+            lockable->lock();
+        }
+    }
+    
+    // RULE 3: Timeout-based deadlock detection
+    template<typename Lockable>
+    static bool try_lock_with_timeout(Lockable& lockable, 
+                                     std::chrono::milliseconds timeout) {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (lockable.try_lock()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        
+        // Log potential deadlock
+        KV_OFFLOAD_LOG(1, "Lock timeout detected - potential deadlock");
+        return false;
+    }
+};
+```
+
+## 🎯 **TASK EXECUTION PATTERNS (Compression-Aware)**
+
+### **Phase 1: Basic Task Execution**
+```cpp
+// Current implementation: Raw data operations
+class phase1_task_executor {
+public:
+    bool execute_copy_task(const compression_aware_task& task) {
+        auto start_time = std::chrono::steady_clock::now();
+        
+        // Find or allocate slot for layer
+        memory_slot* slot = find_or_allocate_slot(task.layer_id);
+        if (!slot) {
+            return false;
+        }
+        
+        // Full copy from llama_context
+        bool success = copy_layer_completely(task.ctx, task.layer_id, slot);
+        
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        
+        // Update metrics
+        stats.total_copies_completed.fetch_add(1);
+        stats.total_bytes_copied.fetch_add(slot->data_size);
+        stats.avg_copy_latency_us.store(duration.count());
+        
+        if (success) {
+            KV_OFFLOAD_LOG(4, "Copied layer %u (%zu bytes, %ld us)", 
+                           task.layer_id, slot->data_size, duration.count());
+        }
+        
+        return success;
+    }
+    
+    bool execute_save_task_raw(const compression_aware_task& task) {
+        auto start_time = std::chrono::steady_clock::now();
+        
+        memory_slot* slot = find_slot_by_layer_id(task.layer_id);
+        if (!slot || !slot->is_valid) {
+            return false;
+        }
+        
+        // Save raw data to SSD
+        bool success = save_raw_data_to_ssd(slot);
+        
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        
+        // Update metrics
+        stats.immediate_saves_completed.fetch_add(1);
+        stats.total_bytes_saved.fetch_add(slot->data_size);
+        stats.avg_save_latency_us.store(duration.count());
+        
+        if (success) {
+            KV_OFFLOAD_LOG(4, "Saved layer %u raw (%zu bytes, %ld us)", 
+                           task.layer_id, slot->data_size, duration.count());
+        }
+        
+        return success;
+    }
+    
+    bool execute_load_task_raw(const compression_aware_task& task) {
+        auto start_time = std::chrono::steady_clock::now();
+        
+        memory_slot* slot = find_or_allocate_slot(task.layer_id);
+        if (!slot) {
+            return false;
+        }
+        
+        // Load raw data from SSD
+        bool success = load_raw_data_from_ssd(task.layer_id, slot);
+        
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        
+        // Update metrics
+        stats.total_loads_completed.fetch_add(1);
+        stats.total_bytes_loaded.fetch_add(slot->data_size);
+        stats.avg_load_latency_us.store(duration.count());
+        
+        if (success) {
+            KV_OFFLOAD_LOG(4, "Loaded layer %u raw (%zu bytes, %ld us)", 
+                           task.layer_id, slot->data_size, duration.count());
+        }
+        
+        return success;
+    }
+};
+```
+
+### **Phase 2: Compression-Aware Task Execution (Future)**
+```cpp
+// Future implementation: Compression-aware operations
+class phase2_compression_executor {
+public:
+    bool execute_save_task_compressed(const compression_aware_task& task) {
+        auto start_time = std::chrono::steady_clock::now();
+        
+        memory_slot* slot = find_slot_by_layer_id(task.layer_id);
+        if (!slot || !slot->is_valid) {
+            return false;
+        }
+        
+        bool success = false;
+        
+        // Try compression if requested
+        if (task.compression_method != COMPRESSION_NONE) {
+            if (compress_slot_data(slot, task.compression_method)) {
+                // Check compression ratio
+                float ratio = float(slot->compressed_size) / slot->data_size;
+                
+                if (ratio <= task.compression_threshold || task.force_compression) {
+                    // Save compressed data
+                    success = save_compressed_data_to_ssd(slot);
+                    
+                    auto end_time = std::chrono::steady_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+                    
+                    // Update compression metrics
+                    compression_stats.compression_operations.fetch_add(1);
+                    compression_stats.bytes_before_compression.fetch_add(slot->data_size);
+                    compression_stats.bytes_after_compression.fetch_add(slot->compressed_size);
+                    compression_stats.compression_time_us.fetch_add(duration.count());
+                    
+                    KV_OFFLOAD_LOG(4, "Saved layer %u compressed (%.1f%% ratio, %ld us)", 
+                                   task.layer_id, ratio * 100, duration.count());
+                    
+                    return success;
+                }
+            }
+        }
+        
+        // Fallback to raw save
+        success = save_raw_data_to_ssd(slot);
+        
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        
+        KV_OFFLOAD_LOG(4, "Saved layer %u raw (compression failed/bypassed, %ld us)", 
+                       task.layer_id, duration.count());
+        
+        return success;
+    }
+    
+    bool execute_load_task_decompressed(const compression_aware_task& task) {
+        auto start_time = std::chrono::steady_clock::now();
+        
+        memory_slot* slot = find_or_allocate_slot(task.layer_id);
+        if (!slot) {
+            return false;
+        }
+        
+        // Determine file format (compressed vs raw)
+        file_format_info format = detect_file_format(task.layer_id);
+        
+        bool success = false;
+        
+        if (format.is_compressed) {
+            // Load compressed data and decompress
+            success = load_compressed_data_from_ssd(task.layer_id, slot);
+            if (success) {
+                success = decompress_slot_data(slot, format.compression_method);
+            }
+            
+            auto end_time = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+            
+            KV_OFFLOAD_LOG(4, "Loaded layer %u decompressed (%zu->%zu bytes, %ld us)", 
+                           task.layer_id, slot->compressed_size, slot->data_size, duration.count());
+        } else {
+            // Load raw data directly
+            success = load_raw_data_from_ssd(task.layer_id, slot);
+            
+            auto end_time = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+            
+            KV_OFFLOAD_LOG(4, "Loaded layer %u raw (%zu bytes, %ld us)", 
+                           task.layer_id, slot->data_size, duration.count());
+        }
+        
+        return success;
+    }
+    
+    bool execute_compression_task(const compression_aware_task& task) {
+        // Pure compression task (no I/O)
+        auto start_time = std::chrono::steady_clock::now();
+        
+        memory_slot* slot = find_slot_by_layer_id(task.layer_id);
+        if (!slot || !slot->is_valid) {
+            return false;
+        }
+        
+        bool success = compress_slot_data(slot, task.compression_method);
+        
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        
+        if (success) {
+            float ratio = float(slot->compressed_size) / slot->data_size;
+            KV_OFFLOAD_LOG(4, "Compressed layer %u (%.1f%% ratio, %ld us)", 
+                           task.layer_id, ratio * 100, duration.count());
+        }
+        
+        return success;
+    }
+};
+```
+
+## 🔧 **THREAD SAFETY PATTERNS (Enhanced)**
+
+### **Lock-Free Operations Where Possible**
+```cpp
+// CRITICAL: Use atomic operations for simple counters
+class lock_free_metrics {
+private:
+    // Phase 1: Basic atomic counters
+    std::atomic<uint64_t> total_tasks_submitted{0};
+    std::atomic<uint64_t> total_tasks_completed{0};
+    std::atomic<uint64_t> total_bytes_processed{0};
+    
+    // Phase 2+: Compression-specific counters
+    std::atomic<uint64_t> compression_successes{0};
+    std::atomic<uint64_t> compression_failures{0};
+    std::atomic<uint64_t> compression_bypasses{0};
+    
+    // Performance tracking
+    std::atomic<uint64_t> avg_task_latency_us{0};
+    std::atomic<uint64_t> peak_memory_usage_bytes{0};
+    
+public:
+    // Lock-free increments
+    void increment_tasks_submitted() { total_tasks_submitted.fetch_add(1, std::memory_order_relaxed); }
+    void increment_tasks_completed() { total_tasks_completed.fetch_add(1, std::memory_order_relaxed); }
+    void add_bytes_processed(uint64_t bytes) { total_bytes_processed.fetch_add(bytes, std::memory_order_relaxed); }
+    
+    // Lock-free reads
+    uint64_t get_tasks_submitted() const { return total_tasks_submitted.load(std::memory_order_relaxed); }
+    uint64_t get_tasks_completed() const { return total_tasks_completed.load(std::memory_order_relaxed); }
+    uint64_t get_pending_tasks() const { return get_tasks_submitted() - get_tasks_completed(); }
+    
+    // Lock-free ratio calculations
+    double get_compression_success_rate() const {
+        uint64_t successes = compression_successes.load(std::memory_order_relaxed);
+        uint64_t total = successes + compression_failures.load(std::memory_order_relaxed);
+        return total > 0 ? double(successes) / total : 0.0;
+    }
+};
+```
+
+### **Reader-Writer Pattern for Slot Access**
+```cpp
+// CRITICAL: Efficient concurrent access to memory slots
+class slot_access_manager {
+private:
+    std::shared_mutex slots_mutex;
+    std::array<memory_slot, 2> memory_slots;
+    
+public:
+    // Multiple readers can check slot status concurrently
+    bool is_layer_in_memory(uint32_t layer_id) const {
+        std::shared_lock<std::shared_mutex> lock(slots_mutex);
+        
+        for (const auto& slot : memory_slots) {
+            if (slot.layer_id == layer_id && slot.is_valid) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    // Multiple readers can access slot data concurrently (read-only)
+    bool copy_layer_data_to_context(uint32_t layer_id, llama_context* ctx) {
+        std::shared_lock<std::shared_mutex> lock(slots_mutex);
+        
+        for (const auto& slot : memory_slots) {
+            if (slot.layer_id == layer_id && slot.is_valid) {
+                // Individual slot lock for data access
+                std::lock_guard<std::mutex> slot_lock(slot.slot_mutex);
+                
+                return llama_kv_layer_set_data(ctx, layer_id, 
+                                              (uint8_t*)slot.k_data, 
+                                              (uint8_t*)slot.v_data);
+            }
+        }
+        return false;
+    }
+    
+    // Exclusive writer access for slot modifications
+    bool allocate_slot_for_layer(uint32_t layer_id) {
+        std::unique_lock<std::shared_mutex> lock(slots_mutex);
+        
+        // Find empty slot or evict LRU
+        memory_slot* target_slot = find_available_slot();
+        if (!target_slot) {
+            target_slot = evict_lru_slot();
+        }
+        
+        if (target_slot) {
+            std::lock_guard<std::mutex> slot_lock(target_slot->slot_mutex);
+            return prepare_slot_for_layer(target_slot, layer_id);
+        }
+        
+        return false;
+    }
+};
+```
+
+## 📊 **PERFORMANCE MONITORING (Compression-Enhanced)**
+
+### **Thread-Level Performance Tracking**
+```cpp
+// CRITICAL: Per-thread and per-task-type performance monitoring
+class thread_performance_monitor {
+private:
+    struct thread_metrics {
+        uint32_t thread_id;
+        thread_role role;
+        
+        // Task counts by type
+        std::atomic<uint64_t> copy_tasks{0};
+        std::atomic<uint64_t> save_tasks{0};
+        std::atomic<uint64_t> load_tasks{0};
+        std::atomic<uint64_t> compression_tasks{0};  // Phase 2+
+        
+        // Timing statistics
+        std::atomic<uint64_t> total_processing_time_us{0};
+        std::atomic<uint64_t> max_task_latency_us{0};
+        std::atomic<uint64_t> min_task_latency_us{UINT64_MAX};
+        
+        // Thread utilization
+        std::chrono::steady_clock::time_point start_time;
+        std::atomic<uint64_t> idle_time_us{0};
+        std::atomic<uint64_t> active_time_us{0};
+    };
+    
+    std::vector<thread_metrics> thread_stats;
+    std::mutex stats_mutex;
+    
+public:
+    void record_task_completion(uint32_t thread_id, kv_task_type task_type, 
+                               uint64_t processing_time_us) {
+        thread_metrics& metrics = thread_stats[thread_id];
+        
+        // Update task counts
+        switch (task_type) {
+            case KV_TASK_COPY_LAYER:
+                metrics.copy_tasks.fetch_add(1);
+                break;
+            case KV_TASK_SAVE_LAYER:
+                metrics.save_tasks.fetch_add(1);
+                break;
+            case KV_TASK_LOAD_LAYER:
+                metrics.load_tasks.fetch_add(1);
+                break;
+            case KV_TASK_COMPRESS_LAYER:
+            case KV_TASK_DECOMPRESS_LAYER:
+                metrics.compression_tasks.fetch_add(1);  // Phase 2+
+                break;
+        }
+        
+        // Update timing statistics
+        metrics.total_processing_time_us.fetch_add(processing_time_us);
+        metrics.active_time_us.fetch_add(processing_time_us);
+        
+        // Update min/max latencies
+        uint64_t current_max = metrics.max_task_latency_us.load();
+        while (processing_time_us > current_max &&
+               !metrics.max_task_latency_us.compare_exchange_weak(current_max, processing_time_us)) {
+            // Retry until successful
+        }
+        
+        uint64_t current_min = metrics.min_task_latency_us.load();
+        while (processing_time_us < current_min &&
+               !metrics.min_task_latency_us.compare_exchange_weak(current_min, processing_time_us)) {
+            // Retry until successful
+        }
+    }
+    
+    void print_thread_performance_report() const {
+        printf("Thread Performance Report:\n");
+        
+        for (const auto& metrics : thread_stats) {
+            uint64_t total_tasks = metrics.copy_tasks + metrics.save_tasks + 
+                                  metrics.load_tasks + metrics.compression_tasks;
+            
+            if (total_tasks > 0) {
+                uint64_t avg_latency = metrics.total_processing_time_us / total_tasks;
+                
+                printf("  Thread %u (%s):\n", metrics.thread_id, get_role_name(metrics.role));
+                printf("    Tasks: copy=%lu, save=%lu, load=%lu, compress=%lu\n",
+                       metrics.copy_tasks.load(), metrics.save_tasks.load(),
+                       metrics.load_tasks.load(), metrics.compression_tasks.load());
+                printf("    Latency: avg=%.2fms, min=%.2fms, max=%.2fms\n",
+                       avg_latency / 1000.0, metrics.min_task_latency_us.load() / 1000.0,
+                       metrics.max_task_latency_us.load() / 1000.0);
+                printf("    Utilization: %.1f%%\n", 
+                       calculate_thread_utilization(metrics));
+            }
+        }
+    }
+    
+private:
+    const char* get_role_name(thread_role role) const {
+        switch (role) {
+            case COPY_SAVE_WORKER: return "Copy+Save";
+            case LOAD_DECOMP_WORKER: return "Load+Decomp";
+            case COMPRESSION_WORKER: return "Compression";
+            case GENERAL_WORKER: return "General";
+            default: return "Unknown";
+        }
+    }
+    
+    double calculate_thread_utilization(const thread_metrics& metrics) const {
+        uint64_t total_time = metrics.active_time_us + metrics.idle_time_us;
+        return total_time > 0 ? double(metrics.active_time_us) / total_time * 100.0 : 0.0;
+    }
+};
+```
+
+## 🎯 **THREADING BEST PRACTICES (Compression-Ready)**
+
+### **Phase 1 Guidelines (Current)**
+- ✅ **Simple round-robin task distribution**
+- ✅ **Lock-free atomic counters for metrics**
+- ✅ **Reader-writer locks for slot access**
+- ✅ **Consistent lock ordering for deadlock prevention**
+- ✅ **Timeout-based deadlock detection**
+
+### **Phase 2 Guidelines (Compression)**
+- 🔄 **Specialized worker threads** (compression vs I/O workers)
+- 🔄 **Priority queue for compression tasks**
+- 🔄 **Adaptive thread pool sizing** based on workload
+- 🔄 **Compression algorithm thread safety**
+- 🔄 **Lock-free compression ratio tracking**
+
+### **Phase 3 Guidelines (N-Layer Extension)**
+- 🔮 **NUMA-aware thread placement**
+- 🔮 **Work-stealing between threads**
+- 🔮 **Dynamic thread role reassignment**
+- 🔮 **Cross-layer batch processing optimization**
+- 🔮 **Predictive task scheduling** based on usage patterns
+
+**Focus: Build rock-solid Phase 1 threading foundation that scales to compression and N-layer workloads!**

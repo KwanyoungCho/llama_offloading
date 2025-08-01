@@ -1,0 +1,446 @@
+
+---
+alwaysApply: true
+description: "KV Cache Architecture and SSD Offloading Implementation Guide"
+---
+
+# KV Cache Architecture & SSD Offloading Implementation Guide
+
+## 🎯 **MISSION CRITICAL**: Compression-Ready llama.cpp KV Cache Flow for SSD Offloading
+
+### **Core Architecture Overview (Updated for Compression)**
+```
+llama_context::decode() → llama_kv_cache_unified → Memory Slots (N개) → Compression → SSD Storage
+                     ↘ graph_build() → graph_compute() ↗          ↘ LZ4/ZSTD ↗
+```
+
+**KEY FILES TO MONITOR**:
+- [llama-context.cpp](mdc:src/llama-context.cpp) - Main inference loop, decode() function
+- [llama-kv-cache-unified.cpp](mdc:src/llama-kv-cache-unified.cpp) - Core KV cache management
+- [llama-kv-cache-unified.h](mdc:src/llama-kv-cache-unified.h) - KV cache interface definitions
+- [llama-kv-offloading.cpp](mdc:src/llama-kv-offloading.cpp) - Compression-ready SSD offloading
+- [llama-kv-offloading.h](mdc:src/llama-kv-offloading.h) - Extensible offloading interface
+- [kv_cache_offloading.md](mdc:src/kv_cache_offloading.md) - Compression & extensibility roadmap
+
+### **🔴 CRITICAL DESIGN PHILOSOPHY**
+
+#### **1. Memory Slot as Compression Buffer Strategy**
+```cpp
+// CRITICAL: Memory slots serve as compression/decompression buffers
+struct memory_slot {
+    uint32_t layer_id;
+    bool is_valid;
+    bool is_loading;
+    
+    // === 현재: 완전 복사 방식 (Compression 준비) ===
+    void* k_data;                             // K 텐서 원본 데이터
+    void* v_data;                             // V 텐서 원본 데이터
+    size_t data_size;                         // 원본 메모리 크기
+    
+    // === 미래: Compression 추가 예정 ===
+    void* compressed_k_data;                  // 압축된 K 텐서 (Phase 2)
+    void* compressed_v_data;                  // 압축된 V 텐서 (Phase 2)
+    size_t compressed_size;                   // 압축된 크기 (Phase 2)
+    compression_method_t compression_type;    // 압축 방식 (Phase 2)
+    
+    size_t seq_len;
+    std::chrono::time_point last_access;
+    std::mutex slot_mutex;
+};
+```
+
+#### **2. Full Copy Strategy for Independence**
+```cpp
+// CRITICAL: Complete data independence from llama_context
+void copy_layer_for_compression(uint32_t layer_id) {
+    // STEP 1: Extract complete layer data from llama_context
+    size_t layer_size = llama_kv_layer_get_size(ctx, layer_id);
+    slot->k_data = malloc(layer_size / 2);
+    slot->v_data = malloc(layer_size / 2);
+    
+    // STEP 2: Full copy to memory slot (independent from source)
+    llama_kv_layer_get_data(ctx, layer_id, slot->k_data, slot->v_data);
+    slot->data_size = layer_size;
+    
+    // STEP 3: (Future) Apply compression to copied data
+    // compress_kv_data(slot->k_data, slot->v_data, &slot->compressed_k_data, 
+    //                  &slot->compressed_v_data, &slot->compressed_size);
+    
+    // STEP 4: Save to SSD (현재: raw data, 미래: compressed data)
+    save_to_ssd(layer_id, slot);
+}
+```
+
+#### **3. Extensible Slot Management (2-Layer → N-Layer)**
+```cpp
+// CRITICAL: Designed for expansion from 2-layer to N-layer
+class extensible_slot_manager {
+private:
+    // === 현재: 2-layer 고정 ===
+    std::array<memory_slot, 2> memory_slots;  // 현재 구현
+    static constexpr uint32_t MAX_LAYERS_IN_MEMORY = 2;
+    
+    // === 미래: N-layer 확장 ===
+    // std::vector<memory_slot> memory_slots;     // 동적 확장 (Phase 3)
+    // uint32_t max_layers_in_memory;             // 설정 가능한 크기
+    
+public:
+    // RULE: Current implementation must support future expansion
+    bool ensure_layer_available(uint32_t layer_id) {
+        // Phase 1: Simple 2-slot LRU
+        return ensure_layer_in_2slot_system(layer_id);
+        
+        // Phase 3: Will become N-slot with advanced eviction
+        // return ensure_layer_in_nsiot_system(layer_id);
+    }
+    
+    // RULE: Compression-aware eviction policy
+    void evict_layer_with_compression(memory_slot* slot) {
+        if (slot->is_valid) {
+            // Phase 1: Save raw data immediately
+            save_raw_data_to_ssd(slot);
+            
+            // Phase 2: Will save compressed data
+            // save_compressed_data_to_ssd(slot);
+        }
+        
+        // Clean up memory (both raw and compressed)
+        cleanup_slot_memory(slot);
+    }
+};
+```
+
+### **⚡ COMPRESSION ROADMAP**
+
+#### **Phase 1: Foundation (현재)**
+```cpp
+// Current: Full copy with immediate save strategy
+struct phase1_implementation {
+    // ✅ Complete data copying from llama_context
+    // ✅ Independent memory slot management
+    // ✅ Immediate save to SSD (no dirty flags)
+    // ✅ 2-layer fixed strategy
+    
+    void save_layer_phase1(uint32_t layer_id) {
+        copy_layer_completely(layer_id);    // Full copy
+        save_immediately_to_ssd(layer_id);  // Raw data save
+    }
+};
+```
+
+#### **Phase 2: Compression Integration (계획)**
+```cpp
+// Future: Add compression to existing copy strategy
+struct phase2_compression {
+    enum compression_method_t {
+        NONE,           // 압축 없음 (Phase 1 호환성)
+        LZ4,            // 빠른 압축 (낮은 레이턴시)
+        ZSTD,           // 균형잡힌 압축 (중간 레이턴시)
+        QUANTIZATION,   // KV-specific 양자화 (최고 압축률)
+        CUSTOM          // 커스텀 압축 알고리즘
+    };
+    
+    void save_layer_phase2(uint32_t layer_id, compression_method_t method) {
+        copy_layer_completely(layer_id);           // 동일: Full copy
+        
+        if (method != NONE) {
+            compress_layer_data(slot, method);     // 새로운: Compression
+            save_compressed_to_ssd(layer_id);     // 새로운: Compressed save
+        } else {
+            save_immediately_to_ssd(layer_id);    // 기존: Raw save (호환성)
+        }
+    }
+};
+```
+
+#### **Phase 3: N-Layer Extension (미래)**
+```cpp
+// Future: Dynamic slot management with compression
+struct phase3_extension {
+    std::vector<memory_slot> dynamic_slots;
+    adaptive_eviction_policy eviction_manager;
+    compression_advisor compression_selector;
+    
+    void save_layer_phase3(uint32_t layer_id) {
+        // 1. Adaptive slot allocation
+        memory_slot* slot = allocate_optimal_slot(layer_id);
+        
+        // 2. Smart compression selection
+        auto method = compression_selector.recommend_method(layer_id);
+        
+        // 3. Advanced save strategy
+        save_layer_adaptively(layer_id, slot, method);
+    }
+};
+```
+
+### **🔧 COMPRESSION-AWARE IMPLEMENTATION STRATEGY**
+
+#### **Memory Management for Compression**
+```cpp
+// CRITICAL: Design memory layout for compression efficiency
+class compression_aware_memory {
+public:
+    // RULE: Allocate memory for both raw and compressed data
+    bool allocate_slot_memory(memory_slot* slot, size_t raw_size) {
+        // Phase 1: Only raw data
+        slot->k_data = aligned_alloc(64, raw_size / 2);  // 64-byte aligned for SIMD
+        slot->v_data = aligned_alloc(64, raw_size / 2);
+        slot->data_size = raw_size;
+        
+        // Phase 2: Add compression buffers
+        // size_t compressed_max = estimate_compressed_size(raw_size);
+        // slot->compressed_k_data = malloc(compressed_max / 2);
+        // slot->compressed_v_data = malloc(compressed_max / 2);
+        
+        return slot->k_data && slot->v_data;
+    }
+    
+    // RULE: SIMD-optimized memory copy for performance
+    void fast_memory_copy(void* dst, const void* src, size_t size) {
+        #ifdef __AVX2__
+            simd_memcpy_avx2(dst, src, size);
+        #else
+            memcpy(dst, src, size);  // Fallback
+        #endif
+    }
+};
+```
+
+#### **Compression Algorithm Interface**
+```cpp
+// CRITICAL: Pluggable compression system
+class compression_interface {
+public:
+    virtual ~compression_interface() = default;
+    virtual size_t compress(const void* src, size_t src_size, 
+                           void* dst, size_t dst_capacity) = 0;
+    virtual size_t decompress(const void* src, size_t src_size,
+                             void* dst, size_t dst_capacity) = 0;
+    virtual compression_method_t get_method() const = 0;
+};
+
+// Phase 2 구현 예정
+class lz4_compressor : public compression_interface {
+    size_t compress(const void* src, size_t src_size, 
+                   void* dst, size_t dst_capacity) override {
+        // return LZ4_compress_default(src, dst, src_size, dst_capacity);
+        return 0;  // Phase 2에서 구현
+    }
+};
+
+class quantization_compressor : public compression_interface {
+    // KV cache specific quantization (가장 효율적)
+    size_t compress(const void* src, size_t src_size,
+                   void* dst, size_t dst_capacity) override {
+        // return quantize_kv_fp16_to_int8(src, dst, src_size);
+        return 0;  // Phase 2에서 구현
+    }
+};
+```
+
+### **📊 EXTENSIBILITY DESIGN PATTERNS**
+
+#### **Configuration Management**
+```cpp
+// CRITICAL: Support runtime configuration changes
+struct offloader_config {
+    // Phase 1: Basic configuration
+    uint32_t num_memory_slots = 2;           // 현재: 고정 2개
+    bool enable_immediate_save = true;       // 현재: 항상 true
+    
+    // Phase 2: Compression configuration
+    compression_method_t default_compression = NONE;     // 기본: 압축 없음
+    float compression_threshold = 0.7f;                  // 압축률 임계값
+    bool adaptive_compression = false;                   // 적응형 압축
+    
+    // Phase 3: Advanced configuration
+    uint32_t max_memory_slots = 16;                      // 최대 슬롯 수
+    bool enable_numa_awareness = false;                  // NUMA 최적화
+    eviction_policy_t eviction_policy = LRU;            // 축출 정책
+};
+
+class configurable_offloader {
+    offloader_config current_config;
+    
+public:
+    // RULE: Runtime reconfiguration support
+    bool update_config(const offloader_config& new_config) {
+        if (validate_config_compatibility(new_config)) {
+            apply_config_changes(new_config);
+            current_config = new_config;
+            return true;
+        }
+        return false;
+    }
+    
+    // RULE: Backward compatibility
+    bool is_config_compatible(const offloader_config& config) const {
+        // Phase 1 configs must always work
+        if (config.num_memory_slots < 2) return false;
+        
+        // Phase 2+ features are optional
+        return true;
+    }
+};
+```
+
+#### **API Evolution Strategy**
+```cpp
+// CRITICAL: API designed for seamless extension
+namespace kv_offloader_api {
+    // Phase 1: Basic API (현재)
+    bool save_layer_immediately(uint32_t layer_id);
+    bool load_layer_sync(uint32_t layer_id);
+    
+    // Phase 2: Compression API (계획)
+    bool save_layer_compressed(uint32_t layer_id, compression_method_t method);
+    bool load_layer_decompressed(uint32_t layer_id);
+    bool set_compression_method(compression_method_t method);
+    
+    // Phase 3: Advanced API (미래)
+    bool configure_memory_slots(uint32_t num_slots);
+    bool enable_adaptive_management(bool enable);
+    bool set_eviction_policy(eviction_policy_t policy);
+    
+    // RULE: Old APIs always supported
+    // Phase 1 APIs work identically in all phases
+}
+```
+
+### **🚨 CRITICAL EXTENSIBILITY PRINCIPLES**
+
+#### **Memory Slot Independence**
+```cpp
+// RULE: Memory slots are completely independent data stores
+class independent_slot_design {
+public:
+    // ✅ Each slot owns its data completely
+    void ensure_slot_independence(memory_slot* slot) {
+        assert(slot->k_data != nullptr);  // Owned memory
+        assert(slot->v_data != nullptr);  // Owned memory
+        // Future: assert(slot->compressed_k_data != nullptr);
+        
+        // Never share pointers with llama_context
+        assert(slot->k_data != ctx->kv_cache.k_data);
+        assert(slot->v_data != ctx->kv_cache.v_data);
+    }
+    
+    // ✅ Data lifecycle is slot-controlled
+    void manage_slot_lifecycle(memory_slot* slot) {
+        // Copy in: llama_context → memory_slot
+        copy_from_context(slot);
+        
+        // Process: Raw → Compressed (Phase 2+)
+        // compress_slot_data(slot);
+        
+        // Save out: memory_slot → SSD
+        save_slot_to_disk(slot);
+        
+        // Copy back: SSD → llama_context (when needed)
+        load_slot_from_disk(slot);
+        copy_to_context(slot);
+    }
+};
+```
+
+#### **Compression Transparency**
+```cpp
+// RULE: Compression must be transparent to higher layers
+class transparent_compression {
+public:
+    // API unchanged regardless of compression
+    bool save_layer(uint32_t layer_id) {
+        memory_slot* slot = find_or_allocate_slot(layer_id);
+        
+        // Always: Full copy from llama_context
+        copy_layer_data(ctx, layer_id, slot);
+        
+        // Phase 1: Save raw data
+        if (current_phase == PHASE_1) {
+            return save_raw_data(slot);
+        }
+        
+        // Phase 2+: Compression before save
+        if (current_phase >= PHASE_2) {
+            compress_slot_data(slot);
+            return save_compressed_data(slot);
+        }
+    }
+    
+    // API unchanged regardless of compression
+    bool load_layer(uint32_t layer_id) {
+        memory_slot* slot = find_slot(layer_id);
+        
+        // Phase 1: Load raw data
+        if (current_phase == PHASE_1) {
+            load_raw_data(slot);
+        }
+        
+        // Phase 2+: Load and decompress
+        if (current_phase >= PHASE_2) {
+            load_compressed_data(slot);
+            decompress_slot_data(slot);
+        }
+        
+        // Always: Copy to llama_context
+        return copy_to_context(ctx, layer_id, slot);
+    }
+};
+```
+
+### **💾 FUTURE-PROOF FILE FORMAT**
+
+#### **Extensible File Header**
+```cpp
+// CRITICAL: File format designed for compression extensions
+struct extensible_kv_file_header {
+    uint32_t magic;                    // 'LKVC' (Llama KV Cache)
+    uint32_t version;                  // Format version (Phase 1: v1, Phase 2: v2, etc.)
+    uint32_t layer_id;                 // Layer identifier
+    uint32_t seq_len;                  // Sequence length
+    
+    // Phase 1: Basic metadata
+    uint32_t n_head_kv;                // KV heads count
+    uint32_t head_dim;                 // Head dimension
+    uint64_t raw_data_size;            // Original data size
+    
+    // Phase 2: Compression metadata
+    compression_method_t compression;   // Compression method used
+    uint64_t compressed_size;          // Compressed data size
+    uint32_t compression_level;        // Compression level
+    uint32_t reserved_1;               // Future use
+    
+    // Phase 3: Advanced metadata
+    uint64_t checksum_raw;             // Raw data checksum
+    uint64_t checksum_compressed;      // Compressed data checksum
+    uint64_t reserved_2[4];            // Future expansion
+};
+
+// File layout: [extensible_header][data (raw or compressed)]
+```
+
+### **🎯 PHASE-SPECIFIC IMPLEMENTATION RULES**
+
+#### **Phase 1 Rules (Current)**
+- ✅ **Full copy**: Always copy complete layer data from llama_context
+- ✅ **2-layer limit**: Exactly 2 memory slots, no more
+- ✅ **Immediate save**: Save layer data immediately after processing
+- ✅ **Raw data**: No compression, direct binary save
+- ✅ **Simple LRU**: Basic least-recently-used eviction
+
+#### **Phase 2 Rules (Compression)**
+- 🔄 **Backward compatibility**: Phase 1 APIs must continue working
+- 🔄 **Optional compression**: Default to no compression for compatibility
+- 🔄 **Pluggable algorithms**: Support multiple compression methods
+- 🔄 **Transparent operation**: Higher layers unaware of compression
+- 🔄 **Performance monitoring**: Track compression ratios and timing
+
+#### **Phase 3 Rules (N-Layer Extension)**
+- 🔮 **Dynamic slots**: Support 2 to N memory slots
+- 🔮 **Advanced eviction**: LRU, LFU, adaptive policies
+- 🔮 **Memory pressure**: Respond to system memory availability
+- 🔮 **NUMA awareness**: Optimize for multi-socket systems
+- 🔮 **Predictive prefetch**: Learn usage patterns
+
+**Focus: Build solid Phase 1 foundation that naturally extends to future phases!**

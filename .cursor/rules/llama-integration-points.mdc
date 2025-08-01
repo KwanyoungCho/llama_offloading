@@ -1,0 +1,667 @@
+
+---
+globs: "*context*,*kv-cache*,*memory*,*kv-offloading*"
+description: "Critical integration points with existing llama.cpp infrastructure for 2-layer KV offloading"
+---
+
+# Compression-Ready Llama.cpp Integration Points for KV Cache SSD Offloading
+
+## 🎯 **CORE INTEGRATION STRATEGY (Compression-Extensible)**
+
+### **Full Copy Integration Philosophy**
+```
+llama_context (Source)    Memory Slots (Independent)    SSD Storage (Persistent)
+┌─────────────────┐      ┌─────────────────────────┐    ┌──────────────────┐
+│ KV Cache        │─────▶│ Raw Data (Phase 1)      │───▶│ Raw Files        │
+│ - Layer N       │ copy │ - K tensor              │save│ - Binary format  │
+│ - Real-time     │      │ - V tensor              │    │ - Immediate      │
+│ - Changing      │      │ Compressed (Phase 2+)   │    │ Compressed Files │
+└─────────────────┘      │ - Compressed K/V        │    │ - LZ4/ZSTD       │
+                         │ - Compression metadata  │    │ - Extensible     │
+                         └─────────────────────────┘    └──────────────────┘
+```
+
+**CRITICAL PRINCIPLE**: Memory slots contain **completely independent copies** of KV cache data, enabling:
+- **Phase 1**: Raw data storage and management
+- **Phase 2**: Compression/decompression without affecting source
+- **Phase 3**: Advanced processing (quantization, transformation)
+
+### **Integration Points Overview (Updated)**
+```cpp
+// CRITICAL: All integration points designed for compression extensibility
+namespace llama_integration_points {
+    // === Phase 1: Foundation Integration ===
+    bool llama_kv_layer_get_size(llama_context* ctx, uint32_t layer_id);     // Size calculation
+    bool llama_kv_layer_get_data(llama_context* ctx, uint32_t layer_id,      // Complete copy OUT
+                                 uint8_t* k_dst, uint8_t* v_dst);
+    bool llama_kv_layer_set_data(llama_context* ctx, uint32_t layer_id,      // Complete copy IN
+                                 const uint8_t* k_src, const uint8_t* v_src);
+    
+    // === Phase 2: Compression Integration (planned) ===
+    bool llama_kv_layer_get_data_compressed(llama_context* ctx, uint32_t layer_id,
+                                            uint8_t* compressed_dst, size_t* compressed_size,
+                                            compression_method_t method);
+    bool llama_kv_layer_set_data_compressed(llama_context* ctx, uint32_t layer_id,
+                                            const uint8_t* compressed_src, size_t compressed_size,
+                                            compression_method_t method);
+    
+    // === Phase 3: Advanced Integration (future) ===
+    bool llama_kv_layer_get_metadata(llama_context* ctx, uint32_t layer_id, kv_metadata* meta);
+    bool llama_kv_layer_transform_data(llama_context* ctx, uint32_t layer_id,
+                                      transformation_fn transform, void* user_data);
+}
+```
+
+## 🔗 **CRITICAL FILE INTEGRATION POINTS**
+
+### **[llama-context.cpp](mdc:src/llama-context.cpp) - Main Integration**
+```cpp
+// CRITICAL: Layer transition hooks for compression-ready offloading
+class llama_context {
+public:
+    // === Phase 1: Basic layer-specific KV access ===
+    size_t kv_layer_get_size(uint32_t layer_id) {
+        // Calculate complete layer size (K + V tensors)
+        if (layer_id >= model.hparams.n_layer) return 0;
+        
+        size_t seq_len = memory->seq_used();
+        size_t head_size = model.hparams.n_head_kv * model.hparams.head_dim();
+        size_t layer_kv_size = 2 * seq_len * head_size * sizeof(float);  // K + V
+        
+        return layer_kv_size;
+    }
+    
+    size_t kv_layer_get_data(uint32_t layer_id, uint8_t* k_dst, uint8_t* v_dst) {
+        // Phase 1: Complete copy of layer KV data
+        if (layer_id >= model.hparams.n_layer) return 0;
+        
+        // Get direct access to layer's KV cache
+        auto* k_cache = memory->get_k_cache_for_layer(layer_id);
+        auto* v_cache = memory->get_v_cache_for_layer(layer_id);
+        
+        size_t layer_size = kv_layer_get_size(layer_id);
+        size_t k_size = layer_size / 2;
+        size_t v_size = layer_size / 2;
+        
+        // Complete memory copy (SIMD-optimized)
+        fast_memory_copy(k_dst, k_cache, k_size);
+        fast_memory_copy(v_dst, v_cache, v_size);
+        
+        return layer_size;
+    }
+    
+    size_t kv_layer_set_data(uint32_t layer_id, const uint8_t* k_src, const uint8_t* v_src) {
+        // Phase 1: Complete restoration of layer KV data
+        if (layer_id >= model.hparams.n_layer) return 0;
+        
+        // Get direct access to layer's KV cache
+        auto* k_cache = memory->get_k_cache_for_layer(layer_id);
+        auto* v_cache = memory->get_v_cache_for_layer(layer_id);
+        
+        size_t layer_size = kv_layer_get_size(layer_id);
+        size_t k_size = layer_size / 2;
+        size_t v_size = layer_size / 2;
+        
+        // Complete memory copy (SIMD-optimized)
+        fast_memory_copy(k_cache, k_src, k_size);
+        fast_memory_copy(v_cache, v_src, v_size);
+        
+        return layer_size;
+    }
+    
+    // === Phase 2: Compression-aware methods (future) ===
+    size_t kv_layer_get_data_compressed(uint32_t layer_id, uint8_t* compressed_dst, 
+                                        size_t* compressed_size, compression_method_t method) {
+        // 1. Get raw layer data
+        size_t raw_size = kv_layer_get_size(layer_id);
+        std::vector<uint8_t> raw_buffer(raw_size);
+        
+        size_t copied = kv_layer_get_data(layer_id, 
+                                         raw_buffer.data(), 
+                                         raw_buffer.data() + raw_size / 2);
+        if (copied != raw_size) return 0;
+        
+        // 2. Apply compression
+        auto* compressor = get_compression_algorithm(method);
+        if (!compressor) return 0;
+        
+        *compressed_size = compressor->compress(raw_buffer.data(), raw_size,
+                                               compressed_dst, *compressed_size);
+        
+        return *compressed_size;
+    }
+    
+private:
+    void fast_memory_copy(void* dst, const void* src, size_t size) {
+        #ifdef __AVX2__
+            simd_memcpy_avx2(dst, src, size);
+        #elif defined(__SSE2__)
+            simd_memcpy_sse2(dst, src, size);
+        #else
+            memcpy(dst, src, size);  // Standard fallback
+        #endif
+    }
+};
+```
+
+### **[llama-kv-cache-unified.cpp](mdc:src/llama-kv-cache-unified.cpp) - Memory Interface**
+```cpp
+// CRITICAL: Extend unified KV cache for layer-specific access
+class llama_kv_cache_unified {
+public:
+    // === Phase 1: Layer-specific data access ===
+    void* get_k_cache_for_layer(uint32_t layer_id) {
+        if (layer_id >= n_layer) return nullptr;
+        
+        // Calculate offset for specific layer
+        size_t layer_offset = calculate_layer_offset(layer_id);
+        size_t k_offset = layer_offset;  // K comes first
+        
+        return static_cast<uint8_t*>(k_data) + k_offset;
+    }
+    
+    void* get_v_cache_for_layer(uint32_t layer_id) {
+        if (layer_id >= n_layer) return nullptr;
+        
+        // Calculate offset for specific layer
+        size_t layer_offset = calculate_layer_offset(layer_id);
+        size_t v_offset = layer_offset;  // V has separate buffer
+        
+        return static_cast<uint8_t*>(v_data) + v_offset;
+    }
+    
+    size_t calculate_layer_offset(uint32_t layer_id) const {
+        // Calculate byte offset for layer in unified cache
+        size_t seq_len = this->seq_used();
+        size_t head_size = n_head_kv * head_dim;
+        size_t tokens_per_layer = seq_len;
+        size_t layer_stride = tokens_per_layer * head_size * sizeof(float);
+        
+        return layer_id * layer_stride;
+    }
+    
+    // === Phase 2: Compression-aware cache management (future) ===
+    bool is_layer_compressible(uint32_t layer_id) const {
+        // Analyze layer data characteristics for compression potential
+        // Check for sparsity, patterns, redundancy
+        return analyze_layer_compression_potential(layer_id);
+    }
+    
+    compression_method_t recommend_compression_method(uint32_t layer_id) const {
+        // Intelligent compression method selection based on layer characteristics
+        if (is_layer_sparse(layer_id)) {
+            return COMPRESSION_QUANTIZATION;  // Good for sparse data
+        } else if (is_layer_repetitive(layer_id)) {
+            return COMPRESSION_LZ4;           // Good for repetitive patterns
+        } else {
+            return COMPRESSION_ZSTD;          // General-purpose
+        }
+    }
+    
+    // === Phase 3: Advanced cache features (future) ===
+    bool setup_numa_aware_allocation(uint32_t numa_node) {
+        // Allocate cache memory on specific NUMA node for phase 3
+        return allocate_on_numa_node(numa_node);
+    }
+};
+```
+
+### **[llama.h](mdc:src/llama.h) - Public API**
+```cpp
+// CRITICAL: Public C API for compression-ready KV cache offloading
+extern "C" {
+    // === Phase 1: Basic KV cache layer API ===
+    LLAMA_API size_t llama_kv_layer_get_size(struct llama_context* ctx, uint32_t layer_id);
+    LLAMA_API size_t llama_kv_layer_get_data(struct llama_context* ctx, uint32_t layer_id,
+                                             uint8_t* k_dst, uint8_t* v_dst);
+    LLAMA_API size_t llama_kv_layer_set_data(struct llama_context* ctx, uint32_t layer_id,
+                                             const uint8_t* k_src, const uint8_t* v_src);
+    LLAMA_API bool   llama_kv_layer_is_valid(struct llama_context* ctx, uint32_t layer_id);
+    
+    // === Phase 2: Compression API (planned) ===
+    // Compression method enumeration
+    typedef enum llama_kv_compression_method {
+        LLAMA_KV_COMPRESSION_NONE = 0,
+        LLAMA_KV_COMPRESSION_LZ4 = 1,
+        LLAMA_KV_COMPRESSION_ZSTD = 2,
+        LLAMA_KV_COMPRESSION_QUANTIZATION = 3,
+        LLAMA_KV_COMPRESSION_CUSTOM = 99
+    } llama_kv_compression_method_t;
+    
+    // Compression-aware layer access
+    LLAMA_API size_t llama_kv_layer_get_data_compressed(
+        struct llama_context* ctx, uint32_t layer_id,
+        uint8_t* compressed_dst, size_t dst_capacity,
+        llama_kv_compression_method_t method, size_t* actual_compressed_size);
+    
+    LLAMA_API size_t llama_kv_layer_set_data_compressed(
+        struct llama_context* ctx, uint32_t layer_id,
+        const uint8_t* compressed_src, size_t compressed_size,
+        llama_kv_compression_method_t method);
+    
+    // Compression utility functions
+    LLAMA_API bool llama_kv_layer_is_compressible(struct llama_context* ctx, uint32_t layer_id);
+    LLAMA_API llama_kv_compression_method_t llama_kv_layer_recommend_compression(
+        struct llama_context* ctx, uint32_t layer_id);
+    LLAMA_API float llama_kv_layer_estimate_compression_ratio(
+        struct llama_context* ctx, uint32_t layer_id, llama_kv_compression_method_t method);
+    
+    // === Phase 3: Advanced API (future) ===
+    // Batch operations
+    LLAMA_API bool llama_kv_layers_get_data_batch(
+        struct llama_context* ctx, const uint32_t* layer_ids, uint32_t num_layers,
+        uint8_t** k_dsts, uint8_t** v_dsts);
+    
+    // Adaptive memory management
+    LLAMA_API bool llama_kv_cache_configure_adaptive_offloading(
+        struct llama_context* ctx, bool enable, uint32_t max_layers_in_memory);
+    
+    // Performance monitoring
+    LLAMA_API bool llama_kv_cache_get_offloading_stats(
+        struct llama_context* ctx, struct llama_kv_offloading_stats* stats);
+}
+```
+
+## 🔧 **MEMORY LAYOUT INTEGRATION (Compression-Ready)**
+
+### **KV Cache Memory Structure Understanding**
+```cpp
+// CRITICAL: Understanding llama.cpp KV cache layout for efficient copying
+class kv_cache_layout_analyzer {
+public:
+    struct layer_memory_map {
+        uint32_t layer_id;
+        void* k_cache_ptr;          // Direct pointer to K cache for this layer
+        void* v_cache_ptr;          // Direct pointer to V cache for this layer
+        size_t k_stride_bytes;      // Bytes between consecutive K entries
+        size_t v_stride_bytes;      // Bytes between consecutive V entries
+        size_t tokens_in_layer;     // Current number of tokens
+        size_t max_tokens;          // Maximum capacity
+        
+        // Phase 2+: Compression characteristics
+        float sparsity_ratio;       // Percentage of zero/near-zero values
+        float entropy;              // Data entropy (compression potential)
+        compression_method_t recommended_method;  // Best compression for this layer
+    };
+    
+    layer_memory_map analyze_layer_layout(llama_context* ctx, uint32_t layer_id) {
+        layer_memory_map map = {};
+        map.layer_id = layer_id;
+        
+        // Get direct memory pointers
+        auto* kv_cache = ctx->memory;
+        map.k_cache_ptr = kv_cache->get_k_cache_for_layer(layer_id);
+        map.v_cache_ptr = kv_cache->get_v_cache_for_layer(layer_id);
+        
+        // Calculate memory layout
+        map.tokens_in_layer = kv_cache->seq_used();
+        map.max_tokens = kv_cache->max_seq();
+        
+        size_t head_size = ctx->model.hparams.n_head_kv * ctx->model.hparams.head_dim();
+        map.k_stride_bytes = head_size * sizeof(float);
+        map.v_stride_bytes = head_size * sizeof(float);
+        
+        // Phase 2: Analyze compression characteristics
+        // map.sparsity_ratio = calculate_sparsity(map.k_cache_ptr, map.v_cache_ptr, map.tokens_in_layer, head_size);
+        // map.entropy = calculate_entropy(map.k_cache_ptr, map.v_cache_ptr, map.tokens_in_layer, head_size);
+        // map.recommended_method = recommend_compression_method(map.sparsity_ratio, map.entropy);
+        
+        return map;
+    }
+    
+    // Phase 1: Efficient copying functions
+    bool copy_layer_data_out(const layer_memory_map& map, uint8_t* k_dst, uint8_t* v_dst) {
+        size_t layer_k_size = map.tokens_in_layer * map.k_stride_bytes;
+        size_t layer_v_size = map.tokens_in_layer * map.v_stride_bytes;
+        
+        // Use SIMD-optimized copy for large transfers
+        if (layer_k_size >= SIMD_THRESHOLD) {
+            simd_memcpy(k_dst, map.k_cache_ptr, layer_k_size);
+            simd_memcpy(v_dst, map.v_cache_ptr, layer_v_size);
+        } else {
+            memcpy(k_dst, map.k_cache_ptr, layer_k_size);
+            memcpy(v_dst, map.v_cache_ptr, layer_v_size);
+        }
+        
+        return true;
+    }
+    
+    bool copy_layer_data_in(const layer_memory_map& map, const uint8_t* k_src, const uint8_t* v_src) {
+        size_t layer_k_size = map.tokens_in_layer * map.k_stride_bytes;
+        size_t layer_v_size = map.tokens_in_layer * map.v_stride_bytes;
+        
+        // Use SIMD-optimized copy for large transfers
+        if (layer_k_size >= SIMD_THRESHOLD) {
+            simd_memcpy(map.k_cache_ptr, k_src, layer_k_size);
+            simd_memcpy(map.v_cache_ptr, v_src, layer_v_size);
+        } else {
+            memcpy(map.k_cache_ptr, k_src, layer_k_size);
+            memcpy(map.v_cache_ptr, v_src, layer_v_size);
+        }
+        
+        return true;
+    }
+    
+private:
+    static constexpr size_t SIMD_THRESHOLD = 4096;  // Use SIMD for transfers > 4KB
+    
+    void simd_memcpy(void* dst, const void* src, size_t size) {
+        #ifdef __AVX2__
+            simd_memcpy_avx2(dst, src, size);
+        #elif defined(__SSE2__)
+            simd_memcpy_sse2(dst, src, size);
+        #else
+            memcpy(dst, src, size);
+        #endif
+    }
+};
+```
+
+### **Inference Loop Integration**
+```cpp
+// CRITICAL: Hook into llama_context::decode() for layer transitions
+class inference_loop_integration {
+public:
+    // Integration point in llama_context::decode()
+    static bool integrate_offloading_with_decode(llama_context* ctx, llama_kv_offloader* offloader) {
+        // This would be called from within llama_context::decode()
+        
+        // Phase 1: Simple layer transition tracking
+        static uint32_t previous_layer = UINT32_MAX;
+        uint32_t current_layer = get_current_processing_layer(ctx);
+        
+        if (current_layer != previous_layer) {
+            // Layer transition detected
+            handle_layer_transition(offloader, previous_layer, current_layer);
+            previous_layer = current_layer;
+        }
+        
+        return true;
+    }
+    
+private:
+    static uint32_t get_current_processing_layer(llama_context* ctx) {
+        // Determine which layer is currently being processed
+        // This requires understanding llama.cpp's inference flow
+        
+        // Method 1: Check computation graph state
+        if (ctx->computation_graph) {
+            return extract_current_layer_from_graph(ctx->computation_graph);
+        }
+        
+        // Method 2: Monitor KV cache write patterns
+        return monitor_kv_cache_writes(ctx);
+    }
+    
+    static void handle_layer_transition(llama_kv_offloader* offloader, 
+                                       uint32_t from_layer, uint32_t to_layer) {
+        if (from_layer != UINT32_MAX) {
+            // Save completed layer (Phase 1: immediate save)
+            offloader->save_layer_immediately(from_layer);
+        }
+        
+        // Ensure next layer is available
+        if (!offloader->is_layer_in_memory(to_layer)) {
+            // Load synchronously if prefetch missed
+            offloader->load_layer_blocking(to_layer);
+        }
+        
+        // Start prefetch for layer after next
+        if (to_layer + 1 < offloader->get_num_layers()) {
+            offloader->start_layer_prefetch(to_layer + 1);
+        }
+    }
+};
+```
+
+## 🔄 **LIFECYCLE INTEGRATION (Compression-Aware)**
+
+### **Context Creation/Destruction**
+```cpp
+// CRITICAL: Integrate offloading with context lifecycle
+class context_lifecycle_integration {
+public:
+    // Called during llama_context creation
+    static bool initialize_offloading_for_context(llama_context* ctx, const char* cache_dir) {
+        // Phase 1: Basic offloader initialization
+        auto* offloader = llama_kv_offloader_init(cache_dir, 2, ctx);  // 2 slots for Phase 1
+        if (!offloader) {
+            return false;
+        }
+        
+        // Configure offloader for this specific model
+        bool configured = llama_kv_offloader_configure(
+            offloader,
+            ctx->model.hparams.n_head,
+            ctx->model.hparams.n_head_kv,
+            ctx->model.hparams.head_dim(),
+            ctx->model.hparams.n_layer
+        );
+        
+        if (!configured) {
+            llama_kv_offloader_free(offloader);
+            return false;
+        }
+        
+        // Attach to context (Phase 1: simple pointer attachment)
+        ctx->kv_offloader = offloader;
+        
+        return true;
+    }
+    
+    // Called during llama_context destruction
+    static void cleanup_offloading_for_context(llama_context* ctx) {
+        if (ctx->kv_offloader) {
+            // Ensure all pending operations complete
+            llama_kv_offloader_synchronize(ctx->kv_offloader);
+            
+            // Clean up offloader
+            llama_kv_offloader_free(ctx->kv_offloader);
+            ctx->kv_offloader = nullptr;
+        }
+    }
+    
+    // Called during model loading
+    static bool configure_offloading_for_model(llama_context* ctx) {
+        if (!ctx->kv_offloader) {
+            return true;  // No offloading configured
+        }
+        
+        // Phase 1: Basic model parameter configuration
+        auto& hparams = ctx->model.hparams;
+        
+        bool success = llama_kv_offloader_configure(
+            ctx->kv_offloader,
+            hparams.n_head,
+            hparams.n_head_kv, 
+            hparams.head_dim(),
+            hparams.n_layer
+        );
+        
+        if (!success) {
+            KV_OFFLOAD_LOG(1, "Failed to configure offloader for model");
+            return false;
+        }
+        
+        // Phase 2+: Analyze model for compression opportunities
+        // analyze_model_compression_potential(ctx);
+        // configure_adaptive_compression(ctx);
+        
+        KV_OFFLOAD_LOG(2, "Configured offloader: %u layers, %u heads, %u kv_heads, %u head_dim",
+                       hparams.n_layer, hparams.n_head, hparams.n_head_kv, hparams.head_dim());
+        
+        return true;
+    }
+};
+```
+
+### **Session Management**
+```cpp
+// CRITICAL: Handle session save/load with compression
+class session_management_integration {
+public:
+    // Enhanced session save with compression support
+    static bool save_session_with_offloading(llama_context* ctx, const char* session_path) {
+        if (!ctx->kv_offloader) {
+            // Fall back to standard session save
+            return standard_session_save(ctx, session_path);
+        }
+        
+        // Phase 1: Save current memory slots + offloaded layers
+        std::string session_dir = std::string(session_path) + "_kv_offload";
+        std::filesystem::create_directories(session_dir);
+        
+        // Save memory slot states
+        bool slots_saved = save_memory_slots_state(ctx->kv_offloader, session_dir);
+        if (!slots_saved) {
+            return false;
+        }
+        
+        // Save offloaded layer registry
+        bool registry_saved = save_offload_registry(ctx->kv_offloader, session_dir);
+        if (!registry_saved) {
+            return false;
+        }
+        
+        // Phase 2+: Save compression configuration
+        // bool compression_saved = save_compression_config(ctx->kv_offloader, session_dir);
+        
+        return slots_saved && registry_saved;
+    }
+    
+    // Enhanced session load with compression support
+    static bool load_session_with_offloading(llama_context* ctx, const char* session_path) {
+        std::string session_dir = std::string(session_path) + "_kv_offload";
+        
+        if (!std::filesystem::exists(session_dir)) {
+            // Fall back to standard session load
+            return standard_session_load(ctx, session_path);
+        }
+        
+        if (!ctx->kv_offloader) {
+            KV_OFFLOAD_LOG(1, "Session has offloading data but no offloader configured");
+            return false;
+        }
+        
+        // Load memory slot states
+        bool slots_loaded = load_memory_slots_state(ctx->kv_offloader, session_dir);
+        if (!slots_loaded) {
+            return false;
+        }
+        
+        // Load offloaded layer registry
+        bool registry_loaded = load_offload_registry(ctx->kv_offloader, session_dir);
+        if (!registry_loaded) {
+            return false;
+        }
+        
+        // Phase 2+: Load compression configuration
+        // bool compression_loaded = load_compression_config(ctx->kv_offloader, session_dir);
+        
+        return slots_loaded && registry_loaded;
+    }
+};
+```
+
+## 📊 **ERROR HANDLING & FALLBACK INTEGRATION**
+
+### **Graceful Degradation Strategy**
+```cpp
+// CRITICAL: Robust error handling with compression fallbacks
+class error_handling_integration {
+public:
+    // Handle offloading failures gracefully
+    static bool handle_offloading_error(llama_context* ctx, offloading_error_type error) {
+        switch (error) {
+            case OFFLOAD_ERROR_DISK_FULL:
+                return handle_disk_full_error(ctx);
+                
+            case OFFLOAD_ERROR_COMPRESSION_FAILED:
+                return handle_compression_failure(ctx);
+                
+            case OFFLOAD_ERROR_MEMORY_ALLOCATION:
+                return handle_memory_allocation_failure(ctx);
+                
+            case OFFLOAD_ERROR_IO_FAILURE:
+                return handle_io_failure(ctx);
+                
+            default:
+                return handle_unknown_error(ctx);
+        }
+    }
+    
+private:
+    static bool handle_disk_full_error(llama_context* ctx) {
+        // Phase 1: Disable offloading, fall back to memory-only
+        if (ctx->kv_offloader) {
+            KV_OFFLOAD_LOG(1, "Disk full - disabling offloading");
+            llama_kv_offloader_disable(ctx->kv_offloader);
+        }
+        
+        // Continue with standard KV cache management
+        return true;
+    }
+    
+    static bool handle_compression_failure(llama_context* ctx) {
+        // Phase 2+: Fall back to raw storage
+        if (ctx->kv_offloader) {
+            KV_OFFLOAD_LOG(2, "Compression failed - falling back to raw storage");
+            llama_kv_offloader_disable_compression(ctx->kv_offloader);
+        }
+        
+        return true;
+    }
+    
+    static bool handle_memory_allocation_failure(llama_context* ctx) {
+        // Free up memory slots, reduce cache size
+        if (ctx->kv_offloader) {
+            KV_OFFLOAD_LOG(1, "Memory allocation failed - reducing cache size");
+            llama_kv_offloader_reduce_memory_slots(ctx->kv_offloader);
+        }
+        
+        return true;
+    }
+    
+    static bool handle_io_failure(llama_context* ctx) {
+        // Retry with exponential backoff, then disable
+        static int retry_count = 0;
+        const int max_retries = 3;
+        
+        if (retry_count < max_retries) {
+            retry_count++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100 * retry_count));
+            return true;  // Retry
+        } else {
+            KV_OFFLOAD_LOG(1, "Persistent I/O failures - disabling offloading");
+            llama_kv_offloader_disable(ctx->kv_offloader);
+            retry_count = 0;
+            return true;  // Continue without offloading
+        }
+    }
+};
+```
+
+## 🎯 **INTEGRATION PHASE ROADMAP**
+
+### **Phase 1: Foundation Integration (Current)**
+- ✅ **Basic layer-specific KV access functions**
+- ✅ **Complete data copying (in/out of llama_context)**
+- ✅ **Context lifecycle hooks** (creation/destruction)
+- ✅ **Error handling with graceful fallback**
+- ✅ **Simple layer transition detection**
+
+### **Phase 2: Compression Integration (Planned)**
+- 🔄 **Compression-aware API extensions**
+- 🔄 **Intelligent compression method selection**
+- 🔄 **Transparent compression/decompression**
+- 🔄 **Compression failure fallback to raw storage**
+- 🔄 **Session save/load with compression metadata**
+
+### **Phase 3: Advanced Integration (Future)**
+- 🔮 **Batch layer operations**
+- 🔮 **Adaptive memory management integration**
+- 🔮 **NUMA-aware cache allocation**
+- 🔮 **Real-time performance monitoring integration**
+- 🔮 **Machine learning-based compression optimization**
+
+**Focus: Build solid Phase 1 integration that naturally extends to compression and advanced features!**
