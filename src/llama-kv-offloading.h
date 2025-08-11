@@ -3,71 +3,92 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <vector>
+#include "ggml.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // =============================================================================
-// KV Cache SSD Offloading - Minimal Implementation
+// KV Cache SSD Offloading - C API (Minimal Implementation)
 // =============================================================================
 
 /**
  * Opaque handle for KV cache offloader
  */
-struct llama_kv_offloader;
+ struct llama_kv_offloader;
 
+ /**
+  * Initialize KV cache offloader
+  *
+  * @param cache_dir Directory for storing KV cache files
+  * @return Offloader handle or NULL on failure
+  */
+ struct llama_kv_offloader* llama_kv_offloader_init(const char* cache_dir);
+ 
+ /**
+  * Free offloader and cleanup all resources
+  */
+ void llama_kv_offloader_free(struct llama_kv_offloader* offloader);
+ 
+ /**
+  * Wait for all pending save operations to complete
+  */
+ void llama_kv_offloader_wait_all(struct llama_kv_offloader* offloader);
+ 
+ /**
+  * Wait for all pending load operations to complete
+  */
+ void llama_kv_offloader_wait_loads(struct llama_kv_offloader* offloader);
+ 
+ /**
+  * Get number of pending save operations
+  */
+ uint32_t llama_kv_offloader_pending_saves(struct llama_kv_offloader* offloader);
+ 
+ /**
+  * Get number of pending load operations
+  */
+ uint32_t llama_kv_offloader_pending_loads(struct llama_kv_offloader* offloader);
+ 
+ /**
+  * Synchronize all pending operations
+  */
+ void llama_kv_offloader_synchronize_all(struct llama_kv_offloader* offloader);
+
+ /**
+  * Submit an asynchronous save for layer_id with K and V data
+  *
+  * @return true if enqueued successfully, false on error
+  */
+ bool llama_kv_offloader_save_layer(
+     struct llama_kv_offloader* offloader,
+     uint32_t layer_id,
+     ggml_tensor* k_tensor,
+     ggml_tensor* v_tensor
+ );
+ 
+ /**
+  * Submit an asynchronous load for layer_id into provided K and V buffers
+  *
+  * @return true if enqueued successfully, false on error
+  */
+ bool llama_kv_offloader_load_layer(
+     struct llama_kv_offloader* offloader,
+     uint32_t layer_id,
+     ggml_tensor* k_tensor,
+     ggml_tensor* v_tensor
+ );
+
+#ifdef __cplusplus
 /**
- * Forward declaration of llama_context
- */
-struct llama_context;
-
-// =============================================================================
-// Core Functions - Save Only
-// =============================================================================
-
-/**
- * Initialize KV cache offloader
- * 
- * @param cache_dir Directory for storing KV cache files
- * @return Offloader handle or NULL on failure
- */
-struct llama_kv_offloader* llama_kv_offloader_init(const char* cache_dir);
-
-/**
- * Free offloader and cleanup all resources
- */
-void llama_kv_offloader_free(struct llama_kv_offloader* offloader);
-
-/**
- * Save layer data to SSD asynchronously
  * 
  * @param offloader Offloader handle
- * @param layer_id Layer ID to save
- * @param k_data K tensor data
- * @param v_data V tensor data
- * @param k_data_size Size of K tensor data
- * @param v_data_size Size of V tensor data
- * @return true if save task submitted successfully
+ * @return Reference to load times vector
  */
-bool llama_kv_offloader_save_layer(
-    struct llama_kv_offloader* offloader,
-    uint32_t layer_id,
-    const void* k_data,
-    const void* v_data,
-    size_t k_data_size,
-    size_t v_data_size
-);
-
-/**
- * Wait for all pending save operations to complete
- */
-void llama_kv_offloader_wait_all(struct llama_kv_offloader* offloader);
-
-/**
- * Get number of pending save operations
- */
-uint32_t llama_kv_offloader_pending_saves(struct llama_kv_offloader* offloader);
+const std::vector<double>& llama_kv_offloader_get_load_times(struct llama_kv_offloader* offloader);
+#endif
 
 // =============================================================================
 // GGML Backend Scheduler Callback Integration

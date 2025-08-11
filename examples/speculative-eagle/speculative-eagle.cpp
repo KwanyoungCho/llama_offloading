@@ -279,6 +279,8 @@ int main(int argc, char ** argv) {
     int n_past_tgt = inp.size();
     int n_past_dft = inp.size() - 1;
 
+    std::vector<int> tgt_dec_times;
+
     // used to determine end of generation
     bool has_eos = false;
 
@@ -718,6 +720,8 @@ int main(int argc, char ** argv) {
             }
         }
 
+
+        const auto tgt_dec_start = ggml_time_us();
         // evaluate the target model on the drafted tokens
         {
             llama_memory_seq_keep(mem_tgt, 0);
@@ -740,6 +744,12 @@ int main(int argc, char ** argv) {
             drafts[s].tokens.erase(drafts[s].tokens.begin());
             drafts[s].dists.erase(drafts[s].dists.begin());
         }
+        const auto tgt_dec_end = ggml_time_us();
+        int tgt_dec_time = (tgt_dec_end - tgt_dec_start) / 1e6f;
+
+        tgt_dec_times.push_back(tgt_dec_time);
+
+        LOG_DBG("tgt_dec_time: %f\n", tgt_dec_time);
     }
 
     auto t_dec_end = ggml_time_us();
@@ -768,6 +778,8 @@ int main(int argc, char ** argv) {
         LOG_INF("  Max length: %d\n", max_len);
         LOG_INF("  Avg length: %.3f\n", avg_len);
     }
+
+    LOG("avg tgt_dec_time: %f\n", std::accumulate(tgt_dec_times.begin(), tgt_dec_times.end(), 0.0) / tgt_dec_times.size());
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");

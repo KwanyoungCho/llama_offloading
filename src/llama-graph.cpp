@@ -1310,7 +1310,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
     
-    // TODO: KV cache load 확인
+    // === FlexGen 스타일: 모든 pending I/O 작업 완료 대기 ===
+    cb(q_cur, "kv_sync", il);
     
     // store to KV cache
     {

@@ -14,11 +14,13 @@ int main(int argc, char ** argv) {
     // path to the model gguf file
     std::string model_path;
     // prompt to generate text from
-    std::string prompt = "Hello my name is";
+    std::string prompt = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Please teach me how to make pancake. ASSISTANT:";
     // number of layers to offload to the GPU
     int ngl = 99;
     // number of tokens to predict
     int n_predict = 32;
+
+    std::vector<double> decode_times;
 
     // parse command line arguments
 
@@ -153,10 +155,13 @@ int main(int argc, char ** argv) {
 
     for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
         // evaluate the current batch with the transformer model
+        const auto t_eval_start = ggml_time_us();
         if (llama_decode(ctx, batch)) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
             return 1;
         }
+        const auto t_eval_end = ggml_time_us();
+        decode_times.push_back((t_eval_end - t_eval_start) / 1000.0);
 
         n_pos += batch.n_tokens;
 
@@ -197,6 +202,10 @@ int main(int argc, char ** argv) {
     llama_perf_sampler_print(smpl);
     llama_perf_context_print(ctx);
     fprintf(stderr, "\n");
+
+    for (int i = 0; i < decode_times.size(); i++) {
+        printf("%d, %f\n", i, decode_times[i]);
+    }
 
     llama_sampler_free(smpl);
     llama_free(ctx);

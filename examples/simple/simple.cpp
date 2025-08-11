@@ -16,7 +16,7 @@ int main(int argc, char ** argv) {
     // path to the model gguf file
     std::string model_path;
     // prompt to generate text from
-    std::string prompt = "Hello my name is";
+    std::string prompt = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Please teach me how to make pancake. ASSISTANT:";
     // number of layers to offload to the GPU
     int ngl = 99;
     // number of tokens to predict
@@ -231,6 +231,11 @@ int main(int argc, char ** argv) {
     llama_perf_context_print(ctx);
     fprintf(stderr, "\n");
 
+    const std::vector<double>& load_times = llama_kv_offloader_get_load_times(kv_offloader);
+    for (int i = 0; i < load_times.size(); i++) {
+        printf("%d, %f\n", i, load_times[i]);
+    }   
+
     // ADDED: Wait for all KV cache saves to complete and cleanup
     // =============================================================================
     printf("\n[KV-SSD] Waiting for all KV cache saves to complete...\n");
@@ -242,6 +247,7 @@ int main(int argc, char ** argv) {
     
     llama_kv_offloader_free(kv_offloader);
     printf("[KV-SSD] ✓ KV offloader cleaned up\n");
+
     // =============================================================================
 
     llama_sampler_free(smpl);
