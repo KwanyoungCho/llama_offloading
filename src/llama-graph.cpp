@@ -1310,8 +1310,18 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * kv_state = static_cast<const llama_kv_cache_unified_state *>(mstate);
     
-    // === FlexGen 스타일: 모든 pending I/O 작업 완료 대기 ===
-    cb(q_cur, "kv_sync", il);
+    // prefetch complete?
+    cb(k_cur, "kv_sync", il);
+
+    // 변경 1. sync + set_tensor
+    // {
+    //     ggml_tensor * k_apply = kv_state->get_k(ctx0, il);
+    //     ggml_tensor * v_apply = kv_state->get_v(ctx0, il);
+    //     ggml_build_forward_expand(gf, k_apply);
+    //     ggml_build_forward_expand(gf, v_apply);
+    //     cb(k_apply, "kv_apply_k", il);
+    //     cb(v_apply, "kv_apply_v", il);
+    // }
     
     // store to KV cache
     {
@@ -1325,9 +1335,17 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = kv_state->get_k(ctx0, il);
     ggml_tensor * v = kv_state->get_v(ctx0, il);
 
-    // kv cache offloading callback func
-    cb(k, "k_cache", il);
-    cb(v, "v_cache", il);
+    // kv cache offloading - store to SSD
+    {
+        const int head = kv_state->get_head();
+        const int n_new = (int) n_tokens;
+        char name_k[64];
+        char name_v[64];
+        snprintf(name_k, sizeof(name_k), "k_cache_save-%d-%d", head, n_new);
+        snprintf(name_v, sizeof(name_v), "v_cache_save-%d-%d", head, n_new);
+        cb(k, name_k, il);
+        cb(v, name_v, il);
+    }
 
     ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, kq_scale);
 
@@ -1339,8 +1357,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, k_next);
         ggml_build_forward_expand(gf, v_next);
         
-        cb(k_next, "k_cache_next", il + 1);
-        cb(v_next, "v_cache_next", il + 1);
+        cb(k_next, "k_cache_load", il + 1);
+        cb(v_next, "v_cache_load", il + 1);
     } else {
         ggml_tensor * k_next = kv_state->get_k(ctx0, 0);
         ggml_tensor * v_next = kv_state->get_v(ctx0, 0);
@@ -1348,8 +1366,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, k_next);
         ggml_build_forward_expand(gf, v_next);
         
-        cb(k_next, "k_cache_next", 0);
-        cb(v_next, "v_cache_next", 0);
+        cb(k_next, "k_cache_load", 0);
+        cb(v_next, "v_cache_load", 0);
     }
 
     cb(cur, "kqv_out", il);

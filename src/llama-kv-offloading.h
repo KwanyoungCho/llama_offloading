@@ -83,9 +83,8 @@ extern "C" {
 
 #ifdef __cplusplus
 /**
- * 
- * @param offloader Offloader handle
- * @return Reference to load times vector
+ * Get accumulated load time metrics
+ * @return Reference to internal vector with averaged times per 32 loads (ms)
  */
 const std::vector<double>& llama_kv_offloader_get_load_times(struct llama_kv_offloader* offloader);
 #endif
@@ -100,6 +99,9 @@ const std::vector<double>& llama_kv_offloader_get_load_times(struct llama_kv_off
 struct llama_kv_callback_data {
     struct llama_kv_offloader* offloader;
     int layer_id;  // 현재 처리중인 layer ID (Load/Save 공통)
+    bool is_sync;
+    bool is_load;
+    bool is_save;
     
     // Load/Save 공통: 텐서 포인터들
     struct ggml_tensor* k_tensor;      // K cache tensor pointer
@@ -107,6 +109,12 @@ struct llama_kv_callback_data {
     
     bool k_cache_ready;
     bool v_cache_ready;
+
+    // delta save/load metadata
+    int k_head;        // starting kv index for K delta
+    int k_n_new;       // number of new kv for K
+    int v_head;        // starting kv index for V delta
+    int v_n_new;       // number of new kv for V
 };
 
 /**

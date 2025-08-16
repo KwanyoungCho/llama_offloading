@@ -10,6 +10,10 @@
 
 #include "../src/llama-model.h"
 
+// ADDED: KV cache SSD offloading for target model
+#include "../../src/llama-kv-offloading.h"
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -24,6 +28,24 @@
 struct callback_data { //callback function의 return 값을 저장할 구조체 선언 -ym-
     std::vector<float> data; //float 타입으로 변경 -ym-
 };
+
+// ADDED: composite callback user data holding both KV offloading and hidden-capture data
+struct composite_cb_data {
+    llama_kv_callback_data kv;
+    callback_data * hidden;
+};
+
+// forward declaration for hidden callback used by wrapper
+static bool cb_get_hidden(struct ggml_tensor * tensor, bool ask, void * user_data);
+
+// ADDED: wrapper callback chaining KV offloading first, then hidden callback
+static bool cb_kv_and_hidden(struct ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * cbd = (composite_cb_data *) user_data;
+    if (llama_kv_ggml_eval_callback(tensor, ask, &cbd->kv)) {
+        return true;
+    }
+    return cb_get_hidden(tensor, ask, cbd->hidden);
+}
 
 static bool cb_get_hidden(struct ggml_tensor * tensor, bool ask, void * user_data) { //callback function -ym-
     if (ask) {
@@ -79,6 +101,7 @@ int main(int argc, char ** argv) {
 
     // needed to get candidate probs even for temp <= 0.0
     params.sampling.n_probs = 128;
+    params.warmup = false;
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SPECULATIVE)) {
         return 1;
@@ -110,8 +133,27 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     callback_data cb_data; //callback data 구조체 변수 선언 -ym-
-    params.cb_eval = cb_get_hidden; //callback function 등록 -ym-
-    params.cb_eval_user_data = &cb_data; //callback function의 return 값을 callback data 구조체 변수로 받음 -ym-
+    // ADDED: initialize KV offloader and composite callback for TARGET model
+    struct llama_kv_offloader * kv_offloader = llama_kv_offloader_init("./eagle_kv_cache");
+    if (!kv_offloader) {
+        LOG_ERR("%s: failed to initialize KV offloader for target model\n", __func__);
+        return 1;
+    }
+    static composite_cb_data kv_hidden_cb_data = {};
+    kv_hidden_cb_data.kv.offloader    = kv_offloader;
+    kv_hidden_cb_data.kv.layer_id     = 0;
+    kv_hidden_cb_data.kv.is_sync      = false;
+    kv_hidden_cb_data.kv.is_load      = false;
+    kv_hidden_cb_data.kv.is_save      = false;
+    kv_hidden_cb_data.kv.k_tensor     = nullptr;
+    kv_hidden_cb_data.kv.v_tensor     = nullptr;
+    kv_hidden_cb_data.kv.k_cache_ready= false;
+    kv_hidden_cb_data.kv.v_cache_ready= false;
+    kv_hidden_cb_data.hidden          = &cb_data;
+
+    // set composite callback for TARGET
+    params.cb_eval = cb_kv_and_hidden;
+    params.cb_eval_user_data = &kv_hidden_cb_data;
 
     llama_model * model_tgt = NULL;
     llama_model * model_dft = NULL;
@@ -134,6 +176,9 @@ int main(int argc, char ** argv) {
     }
 
     params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
+    // IMPORTANT: for DRAFT model do NOT use KV offloading callback
+    params.cb_eval = cb_get_hidden; // restore original hidden callback
+    params.cb_eval_user_data = &cb_data;
     //params.cb_eval = cb_get_latency;
     common_init_result llama_init_dft = common_init_from_params(params);
 
@@ -796,6 +841,17 @@ int main(int argc, char ** argv) {
     }
 
     llama_batch_free(batch_dft);
+
+    // ADDED: print KV load times for target
+    {
+        const std::vector<double>& load_times = llama_kv_offloader_get_load_times(kv_offloader);
+        for (int i = 0; i < (int) load_times.size(); ++i) {
+            LOG("kv_load_time[%d] = %f ms\n", i, load_times[i]);
+        }
+        // ensure all pending I/O complete and cleanup
+        llama_kv_offloader_wait_all(kv_offloader);
+        llama_kv_offloader_free(kv_offloader);
+    }
 
     llama_backend_free();
 

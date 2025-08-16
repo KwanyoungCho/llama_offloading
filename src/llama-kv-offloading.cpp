@@ -31,7 +31,6 @@
 enum task_type {
     TASK_SAVE,
     TASK_LOAD,
-    TASK_UPDATE_SIZE
 };
 
 struct kv_task {
@@ -47,9 +46,15 @@ struct kv_task {
     // Load용 데이터
     ggml_tensor* k_tensor;
     ggml_tensor* v_tensor;
+
+    // Delta metadata
+    int k_head;
+    int k_n_new;
+    int v_head;
+    int v_n_new;
     
     kv_task() : type(TASK_SAVE), layer_id(0), k_data(nullptr), v_data(nullptr), k_size(0), v_size(0), 
-               k_tensor(nullptr), v_tensor(nullptr) {}
+               k_tensor(nullptr), v_tensor(nullptr), k_head(0), k_n_new(0), v_head(0), v_n_new(0) {}
 };
 
 // =============================================================================
@@ -128,41 +133,81 @@ struct llama_kv_offloader {
         }
     }
     
-    bool save_layer(uint32_t layer_id, ggml_tensor* k_tensor, ggml_tensor* v_tensor) {
+    bool save_layer(uint32_t layer_id, ggml_tensor* k_tensor, ggml_tensor* v_tensor,
+                    int k_head, int k_n_new, int v_head, int v_n_new) {
         if (shutdown_flag.load()) {
             return false;
         }
-        
-        // Allocate and copy data
-        void* k_copy = malloc(ggml_nbytes(k_tensor));
-        void* v_copy = malloc(ggml_nbytes(v_tensor));
-        
-        if (!k_copy || !v_copy || ggml_nbytes(k_tensor) == 0 || ggml_nbytes(v_tensor) == 0) {
-            free(k_copy);
-            free(v_copy);
-            printf("[KV-SSD] ✗ Failed to allocate memory for layer %d\n", layer_id);
-            return false;
-        }
-        
-        ggml_backend_tensor_get(k_tensor, k_copy, 0, ggml_nbytes(k_tensor));
-        ggml_backend_tensor_get(v_tensor, v_copy, 0, ggml_nbytes(v_tensor));
-
-        // Create save task
+        // Create delta save task with pre-copied CPU buffers (synchronous copy here)
         kv_task task;
         task.type = TASK_SAVE;
         task.layer_id = layer_id;
-        task.k_data = k_copy;
-        task.v_data = v_copy;
-        task.k_size = ggml_nbytes(k_tensor);
-        task.v_size = ggml_nbytes(v_tensor);
-        
-        // Submit to queue
+        task.k_tensor = k_tensor;
+        task.v_tensor = v_tensor;
+        task.k_head = k_head;
+        task.k_n_new = k_n_new;
+        task.v_head = v_head;
+        task.v_n_new = v_n_new;
+ 
+        // Gather tensor shapes/strides
+        const int64_t k_ne0 = k_tensor->ne[0];
+        const int64_t k_ne1 = k_tensor->ne[1];
+        const size_t  k_nb0 = k_tensor->nb[0];
+        const size_t  k_nb1 = k_tensor->nb[1];
+        const size_t  k_nb2 = k_tensor->nb[2];
+ 
+        const int64_t v_ne1 = v_tensor->ne[1];
+        const int64_t v_ne2 = v_tensor->ne[2];
+        const size_t  v_nb0 = v_tensor->nb[0];
+        const size_t  v_nb1 = v_tensor->nb[1];
+        const size_t  v_nb2 = v_tensor->nb[2];
+ 
+        // K packed delta buffer: [h in 0..ne1) x [t in 0..k_n_new): row_bytes
+        const size_t k_row_bytes = (size_t)k_ne0 * k_nb0;
+        const size_t k_total_delta = (size_t)k_ne1 * (size_t)k_n_new * k_row_bytes;
+        void* k_packed = nullptr;
+        if (k_total_delta > 0) {
+            k_packed = malloc(k_total_delta);
+            if (!k_packed) return false;
+            uint8_t* dst = static_cast<uint8_t*>(k_packed);
+            for (int64_t h = 0; h < k_ne1; ++h) {
+                for (int t = 0; t < k_n_new; ++t) {
+                    const size_t tensor_off = (size_t)h * k_nb1 + (size_t)(k_head + t) * k_nb2;
+                    ggml_backend_tensor_get(k_tensor, dst, tensor_off, k_row_bytes);
+                    dst += k_row_bytes;
+                }
+            }
+        }
+        task.k_data = k_packed;
+        task.k_size = k_total_delta;
+ 
+        // V packed delta buffer (v_trans=true): [h in 0..ne1) x [e in 0..ne2): block_bytes across kv
+        const size_t v_block_bytes = (size_t)v_n_new * v_nb0; // nb0=elsize
+        const size_t v_total_delta = (size_t)v_ne1 * (size_t)v_ne2 * v_block_bytes;
+        void* v_packed = nullptr;
+        if (v_total_delta > 0) {
+            v_packed = malloc(v_total_delta);
+            if (!v_packed) {
+                free(k_packed);
+                return false;
+            }
+            uint8_t* dst = static_cast<uint8_t*>(v_packed);
+            for (int64_t h = 0; h < v_ne1; ++h) {
+                for (int64_t e = 0; e < v_ne2; ++e) {
+                    const size_t tensor_off = (size_t)h * v_nb1 + (size_t)e * v_nb2 + (size_t)v_head * v_nb0;
+                    ggml_backend_tensor_get(v_tensor, dst, tensor_off, v_block_bytes);
+                    dst += v_block_bytes;
+                }
+            }
+        }
+        task.v_data = v_packed;
+        task.v_size = v_total_delta;
+ 
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
             task_queue.push(task);
             pending_saves.fetch_add(1);
         }
-        
         queue_cv.notify_one();
         return true;
     }
@@ -184,27 +229,6 @@ struct llama_kv_offloader {
             std::lock_guard<std::mutex> lock(queue_mutex);
             task_queue.push(task);
             pending_loads.fetch_add(1);
-        }
-        
-        queue_cv.notify_one();
-        return true;
-    }
-    
-    bool update_load_size(size_t new_k_size, size_t new_v_size) {
-        if (shutdown_flag.load()) {
-            return false;
-        }
-        
-        // Create size update task
-        kv_task task;
-        task.type = TASK_UPDATE_SIZE;
-        task.k_size = new_k_size;
-        task.v_size = new_v_size;
-        
-        // Submit to queue (최우선으로 처리되도록)
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex);
-            task_queue.push(task);
         }
         
         queue_cv.notify_one();
@@ -276,7 +300,7 @@ private:
             
             // Execute task based on type
             if (task.type == TASK_SAVE) {
-                execute_save(task);
+                execute_save_delta(task);
                 pending_saves.fetch_sub(1);
             } else if (task.type == TASK_LOAD) {
                 // 시간 측정
@@ -294,263 +318,151 @@ private:
                 const auto t_load_end = ggml_time_us();
                 load_time += (t_load_end - t_load_start) / 1000.0;
                 iteration++;
-                
                 if (iteration == 32) {
-                    // printf("task.layer_id: %d, load_time: %f\n", task.layer_id, load_time / 32);
-                    load_times.push_back(load_time);
+                    load_times.push_back(load_time / 32.0);
                     iteration = 0;
                     load_time = 0;
                 }
-            } else if (task.type == TASK_UPDATE_SIZE) {
-                execute_update_size(task);
             }
             
             completion_cv.notify_all();
         }
     }
     
-    // === DATA load 시 데이터 무결성 검증 (이후 제거 예정) ===
-    bool verify_data_integrity(const kv_task& task, void* k_loaded, void* v_loaded, size_t k_size_loaded, size_t v_size_loaded) {
-
-        size_t k_size = ggml_nbytes(task.k_tensor);
-        size_t v_size = ggml_nbytes(task.v_tensor);
-
-        void * k_copy = malloc(k_size);
-        void * v_copy = malloc(v_size);
-
-        ggml_backend_tensor_get(task.k_tensor, k_copy, 0, k_size);
-        ggml_backend_tensor_get(task.v_tensor, v_copy, 0, v_size);
-
-        const char* original_k = static_cast<const char*>(k_copy);
-        const char* loaded_k = static_cast<const char*>(k_loaded);
-
-        const char* original_v = static_cast<const char*>(v_copy);
-        const char* loaded_v = static_cast<const char*>(v_loaded);
-
-        if (!k_copy || !v_copy || !k_loaded || !v_loaded) {
-            printf("[KV-SSD] ⚠ Cannot verify data integrity: null pointers\n");
-            return false;
-        }
-        
-        size_t k_mismatches = 0;
-        size_t v_mismatches = 0;
-        
-        // Verify K tensor data integrity
-        if (k_size > 0) {
-            
-            
-            for (size_t i = 0; i < k_size_loaded; ++i) {
-                if (original_k[i] != loaded_k[i]) {
-                    k_mismatches++;
-                    if (k_mismatches <= 5) {  // Log first 5 mismatches only
-                        printf("[KV-SSD] ⚠ K data mismatch at byte %zu: GPU_current=0x%02X, file_loaded=0x%02X\n", 
-                               i, (unsigned char)original_k[i], (unsigned char)loaded_k[i]);
-                    }
+    // removed verification helpers and saved_layers usage
+ 
+    // Lightweight verification: compare SSD-read buffers with current GPU tensor contents (first N bytes)
+    bool verify_data_integrity(const kv_task& task, void* k_loaded, void* v_loaded,
+                               size_t k_size_loaded, size_t v_size_loaded) {
+        bool ok = true;
+        if (k_loaded && k_size_loaded > 0) {
+            void* k_ref = malloc(k_size_loaded);
+            if (k_ref) {
+                ggml_backend_tensor_get(task.k_tensor, k_ref, 0, k_size_loaded);
+                if (std::memcmp(k_ref, k_loaded, k_size_loaded) != 0) {
+                    printf("[KV-SSD] ✗ K data mismatch for layer %u (bytes=%zu)\n", task.layer_id, k_size_loaded);
+                    ok = false;
                 }
+                free(k_ref);
             }
         }
-        
-        // Verify V tensor data integrity
-        if (v_size > 0) {
-            for (size_t i = 0; i < v_size_loaded; ++i) {
-                if (original_v[i] != loaded_v[i]) {
-                    v_mismatches++;
-                    if (v_mismatches <= 5) {  // Log first 5 mismatches only
-                        printf("[KV-SSD] ⚠ V data mismatch at byte %zu: GPU_current=0x%02X, file_loaded=0x%02X\n", 
-                               i, (unsigned char)original_v[i], (unsigned char)loaded_v[i]);
-                    }
+        if (v_loaded && v_size_loaded > 0) {
+            void* v_ref = malloc(v_size_loaded);
+            if (v_ref) {
+                ggml_backend_tensor_get(task.v_tensor, v_ref, 0, v_size_loaded);
+                if (std::memcmp(v_ref, v_loaded, v_size_loaded) != 0) {
+                    printf("[KV-SSD] ✗ V data mismatch for layer %u (bytes=%zu)\n", task.layer_id, v_size_loaded);
+                    ok = false;
                 }
+                free(v_ref);
             }
         }
-        
-        // Summary report
-        bool data_matches = (k_mismatches == 0 && v_mismatches == 0);
-        
-        if (data_matches) {
-            // printf("[KV-SSD] ✓ Data integrity verified for layer %u: K=%zu bytes, V=%zu bytes (PERFECT MATCH)\n", 
-            //        task.layer_id, k_size, v_size);
-        } else {
-            printf("[KV-SSD] ✗ Data integrity FAILED for layer %u: K_mismatches=%zu/%zu, V_mismatches=%zu/%zu\n", 
-                   task.layer_id, k_mismatches, k_size_loaded, v_mismatches, v_size_loaded);
-                   
-            // === DEBUG: GPU 현재 데이터 샘플 출력 ===
-            const unsigned char* gpu_k_bytes = static_cast<const unsigned char*>(k_copy);
-            const unsigned char* gpu_v_bytes = static_cast<const unsigned char*>(v_copy);
-            
-            printf("[KV-SSD] 🖥️  GPU  Layer %d K[0-15]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n", 
-                   task.layer_id,
-                   gpu_k_bytes[0], gpu_k_bytes[1], gpu_k_bytes[2], gpu_k_bytes[3],
-                   gpu_k_bytes[4], gpu_k_bytes[5], gpu_k_bytes[6], gpu_k_bytes[7],
-                   gpu_k_bytes[8], gpu_k_bytes[9], gpu_k_bytes[10], gpu_k_bytes[11],
-                   gpu_k_bytes[12], gpu_k_bytes[13], gpu_k_bytes[14], gpu_k_bytes[15]);
-                   
-            printf("[KV-SSD] 🖥️  GPU  Layer %d V[0-15]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n", 
-                   task.layer_id,
-                   gpu_v_bytes[0], gpu_v_bytes[1], gpu_v_bytes[2], gpu_v_bytes[3],
-                   gpu_v_bytes[4], gpu_v_bytes[5], gpu_v_bytes[6], gpu_v_bytes[7],
-                   gpu_v_bytes[8], gpu_v_bytes[9], gpu_v_bytes[10], gpu_v_bytes[11],
-                   gpu_v_bytes[12], gpu_v_bytes[13], gpu_v_bytes[14], gpu_v_bytes[15]);
+        if (ok) {
+            printf("[KV-SSD] ✓ SSD vs GPU match for layer %u (K=%zu, V=%zu)\n", task.layer_id, k_size_loaded, v_size_loaded);
         }
+        return ok;
+    }
 
-
-        free(k_copy);
-        free(v_copy);
-        
-        return data_matches;
+    void ensure_file_size(const std::string & path, size_t min_size) {
+        std::error_code ec;
+        if (!std::filesystem::exists(path)) {
+            // create empty file
+            std::ofstream f(path, std::ios::binary);
+            f.close();
         }
-    
-    // === SAVE-LOAD 무결성 검증 함수 === // 이 코드를 사용하기 위해서는 save 동작에서 copy 부분을 free 하지 않도록 해야함!!!! & 저장
-    void verify_save_load_integrity(uint32_t layer_id, void* k_loaded, void* v_loaded, size_t k_size_loaded, size_t v_size_loaded) {
-        std::lock_guard<std::mutex> lock(saved_data_mutex);
-        
-        auto it = saved_layers.find(layer_id);
-        if (it == saved_layers.end()) {
-            printf("[KV-SSD] ⚠ Layer %d: No saved data found for verification\n", layer_id);
+        auto cur = std::filesystem::exists(path) ? std::filesystem::file_size(path, ec) : 0;
+        if (ec || cur < min_size) {
+            std::filesystem::resize_file(path, min_size, ec);
+        }
+    }
+ 
+    void execute_save_delta(const kv_task& task) {
+        // K/V split files
+        std::string kfile = cache_dir + "/layer_" + std::to_string(task.layer_id) + "_K.bin";
+        std::string vfile = cache_dir + "/layer_" + std::to_string(task.layer_id) + "_V.bin";
+
+        // derive tensor shapes/strides
+        auto * kt = task.k_tensor;
+        auto * vt = task.v_tensor;
+        if (!kt || !vt) return;
+
+        const int64_t k_ne0 = kt->ne[0];
+        const int64_t k_ne1 = kt->ne[1];
+        const int64_t k_ne2 = kt->ne[2];
+        const size_t  k_nb0 = kt->nb[0];
+        const size_t  k_nb1 = kt->nb[1];
+        const size_t  k_nb2 = kt->nb[2];
+
+        const int64_t v_ne0 = vt->ne[0];
+        const int64_t v_ne1 = vt->ne[1];
+        const int64_t v_ne2 = vt->ne[2];
+        const size_t  v_nb0 = vt->nb[0];
+        const size_t  v_nb1 = vt->nb[1];
+        const size_t  v_nb2 = vt->nb[2];
+
+        // Compute minimal file size needed for full tensors (matches ggml_nbytes)
+        const size_t k_total_bytes = (k_ne0 > 0 && k_ne1 > 0 && k_ne2 > 0) ? (k_ne0 - 1) * k_nb0 + (k_ne1 - 1) * k_nb1 + (k_ne2 - 1) * k_nb2 + k_nb0 : 0;
+        const size_t v_total_bytes = (v_ne0 > 0 && v_ne1 > 0 && v_ne2 > 0) ? (v_ne0 - 1) * v_nb0 + (v_ne1 - 1) * v_nb1 + (v_ne2 - 1) * v_nb2 + v_nb0 : 0;
+
+        ensure_file_size(kfile, k_total_bytes);
+        ensure_file_size(vfile, v_total_bytes);
+
+        // Open files R/W
+        std::fstream kfs(kfile, std::ios::in | std::ios::out | std::ios::binary);
+        std::fstream vfs(vfile, std::ios::in | std::ios::out | std::ios::binary);
+        if (!kfs.is_open() || !vfs.is_open()) {
+            printf("[KV-SSD] ✗ Cannot open K/V files for layer %u\n", task.layer_id);
             return;
         }
         
-        const saved_data& saved = it->second;
-        
-        // 크기 검증
-        if (saved.k_size != k_size_loaded || saved.v_size != v_size_loaded) {
-            printf("[KV-SSD] ✗ Layer %d SIZE MISMATCH: saved K=%zu V=%zu, loaded K=%zu V=%zu\n", 
-                   layer_id, saved.k_size, saved.v_size, k_size_loaded, v_size_loaded);
+        // K: for each head and each new token, write one contiguous row (embd_k_per_head) from packed buffer
+        const size_t k_row_bytes = (size_t) k_ne0 * k_nb0;
+        const uint8_t* ksrc = static_cast<const uint8_t*>(task.k_data);
+        for (int64_t h = 0; h < k_ne1; ++h) {
+            for (int t = 0; t < task.k_n_new; ++t) {
+                const size_t tensor_off = (size_t)h * k_nb1 + (size_t)(task.k_head + t) * k_nb2;
+                kfs.seekp((std::streamoff)tensor_off, std::ios::beg);
+                kfs.write(reinterpret_cast<const char*>(ksrc), (std::streamsize)k_row_bytes);
+                ksrc += k_row_bytes;
+                if (kfs.fail()) {
+                    printf("[KV-SSD] ✗ K delta write failed: layer %u, head %ld, t %d\n", task.layer_id, (long)h, t);
             return;
         }
-        
-        // K data 전체 비교
-        size_t k_mismatches = 0;
-        const char* saved_k = static_cast<const char*>(saved.k_data);
-        const char* loaded_k = static_cast<const char*>(k_loaded);
-        
-        for (size_t i = 0; i < saved.k_size; ++i) {
-            if (saved_k[i] != loaded_k[i]) {
-                k_mismatches++;
-                if (k_mismatches <= 5) {  // 처음 5개만 로깅
-                    printf("[KV-SSD] ⚠ Layer %d K mismatch at byte %zu: saved=0x%02X, loaded=0x%02X\n", 
-                           layer_id, i, (unsigned char)saved_k[i], (unsigned char)loaded_k[i]);
+            }
+        }
+
+        // V: v_trans=true layout (get_v for non-flash attn): kv is dim0 with nb0=elsize => contiguous across kv
+        const size_t v_block_bytes = (size_t)task.v_n_new * v_nb0; // bytes across kv for a single (head, emb)
+        const uint8_t* vsrc = static_cast<const uint8_t*>(task.v_data);
+        for (int64_t h = 0; h < v_ne1; ++h) {
+            for (int64_t e = 0; e < v_ne2; ++e) {
+                const size_t tensor_off = (size_t)h * v_nb1 + (size_t)e * v_nb2 + (size_t)task.v_head * v_nb0;
+                vfs.seekp((std::streamoff)tensor_off, std::ios::beg);
+                vfs.write(reinterpret_cast<const char*>(vsrc), (std::streamsize)v_block_bytes);
+                vsrc += v_block_bytes;
+                if (vfs.fail()) {
+                    printf("[KV-SSD] ✗ V delta write failed: layer %u, head %ld, emb %ld\n", task.layer_id, (long)h, (long)e);
+                    return;
                 }
             }
         }
-        
-        // V data 전체 비교  
-        size_t v_mismatches = 0;
-        const char* saved_v = static_cast<const char*>(saved.v_data);
-        const char* loaded_v = static_cast<const char*>(v_loaded);
-        
-        for (size_t i = 0; i < saved.v_size; ++i) {
-            if (saved_v[i] != loaded_v[i]) {
-                v_mismatches++;
-                if (v_mismatches <= 5) {  // 처음 5개만 로깅
-                    printf("[KV-SSD] ⚠ Layer %d V mismatch at byte %zu: saved=0x%02X, loaded=0x%02X\n", 
-                           layer_id, i, (unsigned char)saved_v[i], (unsigned char)loaded_v[i]);
-                }
-            }
-        }
-        
-        // 결과 출력
-        if (k_mismatches == 0 && v_mismatches == 0) {
-            printf("[KV-SSD] ✓ Layer %d SAVE-LOAD integrity verified: K=%zu V=%zu bytes (PERFECT MATCH)\n", 
-                   layer_id, saved.k_size, saved.v_size);
-        } else {
-            printf("[KV-SSD] ✗ Layer %d SAVE-LOAD integrity FAILED: K_mismatches=%zu/%zu, V_mismatches=%zu/%zu\n", 
-                   layer_id, k_mismatches, saved.k_size, v_mismatches, saved.v_size);
-        }
-        
-        // 검증 완료 후 saved data 정리
-        free(saved.k_data);
-        free(saved.v_data);
-        saved_layers.erase(it);
+
+        kfs.flush();
+        vfs.flush();
+
+        // free packed buffers
+        if (task.k_data) free(task.k_data);
+        if (task.v_data) free(task.v_data);
     }
     
-    void execute_save(const kv_task& task) {
-        std::string filename = cache_dir + "/layer_" + std::to_string(task.layer_id) + ".bin";
-        std::string temp_filename = filename + ".tmp";
-        
-        // Write to temp file
-        // 시간 측정
-        // const auto t_save_start = ggml_time_us();
-
-        std::ofstream file(temp_filename, std::ios::binary);
-        if (file.is_open()) {
-            // === DEBUG: Save 시점 데이터 샘플 로깅 ===
-            // const unsigned char* k_data_bytes = static_cast<const unsigned char*>(task.k_data);
-            // const unsigned char* v_data_bytes = static_cast<const unsigned char*>(task.v_data);
-            
-            // printf("[KV-SSD] 💾 SAVE Layer %d K[0-15]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n", 
-            //        task.layer_id, 
-            //        k_data_bytes[0], k_data_bytes[1], k_data_bytes[2], k_data_bytes[3],
-            //        k_data_bytes[4], k_data_bytes[5], k_data_bytes[6], k_data_bytes[7],
-            //        k_data_bytes[8], k_data_bytes[9], k_data_bytes[10], k_data_bytes[11],
-            //        k_data_bytes[12], k_data_bytes[13], k_data_bytes[14], k_data_bytes[15]);
-                   
-            // printf("[KV-SSD] 💾 SAVE Layer %d V[0-15]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n", 
-            //        task.layer_id,
-            //        v_data_bytes[0], v_data_bytes[1], v_data_bytes[2], v_data_bytes[3],
-            //        v_data_bytes[4], v_data_bytes[5], v_data_bytes[6], v_data_bytes[7],
-            //        v_data_bytes[8], v_data_bytes[9], v_data_bytes[10], v_data_bytes[11],
-            //        v_data_bytes[12], v_data_bytes[13], v_data_bytes[14], v_data_bytes[15]);
-            
-            // Write K data
-            file.write(static_cast<const char*>(task.k_data), task.k_size);
-            // Write V data  
-            file.write(static_cast<const char*>(task.v_data), task.v_size);
-            file.close();
-
-            // 시간 측정
-            // const auto t_save_end = ggml_time_us();
-            // iteration++;
-            // save_time += (t_save_end - t_save_start) / 1000.0;
-
-            // if (iteration == 32) {
-            //     printf("%d, %f\n", task.layer_id, save_time / 32);
-            //     iteration = 0;
-            //     save_time = 0;
-            // }
-
-            // Atomic rename
-            std::filesystem::rename(temp_filename, filename);
-            
-            // === Save 데이터 보관 (Load 시점에서 검증하기 위함) ===
-            // {
-            //     std::lock_guard<std::mutex> lock(saved_data_mutex);
-            //     saved_data data;
-            //     data.k_data = task.k_data;  // 소유권 이전 (free 안함)
-            //     data.v_data = task.v_data;  // 소유권 이전 (free 안함)
-            //     data.k_size = task.k_size;
-            //     data.v_size = task.v_size;
-            //     saved_layers[task.layer_id] = data;
-            // }
-            
-            // printf("[KV-SSD] ✓ Saved layer %d to SSD (%zu + %zu bytes)\n", 
-            //        task.layer_id, task.k_size, task.v_size);
-        
-            // Cleanup // 검증 코드 사용 시 주석 처리해야함!!
-            free(task.k_data);
-            free(task.v_data);
-
-        } else {
-            // 파일 쓰기 실패 시에만 cleanup
-            free(task.k_data);
-            free(task.v_data);
-        }
-    }
-    
-    void execute_update_size(const kv_task& task) {
-        // Worker thread에서 load 크기 업데이트
-        current_load_k_size = task.k_size;
-        current_load_v_size = task.v_size;
-        
-        // printf("[KV-SSD] 🔄 Updated load size: K=%zu, V=%zu (total=%zu)\n", 
-        //        current_load_k_size, current_load_v_size, current_load_k_size + current_load_v_size);
-    }
+    void execute_update_size(const kv_task& task) {}
     
     void execute_load(const kv_task& task) {
         reset_prefetch_status(task.layer_id);
         
-        // Worker thread에서 current_load_size 사용
-        size_t k_size = current_load_k_size;
-        size_t v_size = current_load_v_size;
+        // Use tensor sizes directly
+        size_t k_size = ggml_nbytes(task.k_tensor);
+        size_t v_size = ggml_nbytes(task.v_tensor);
         
         void * k_copy = malloc(k_size);
         void * v_copy = malloc(v_size);
@@ -562,102 +474,84 @@ private:
             return;
         }
 
-        std::string filename = cache_dir + "/layer_" + std::to_string(task.layer_id) + ".bin";
-        
-        // Check if file exists
-        if (!std::filesystem::exists(filename)) {
-            printf("[KV-SSD] ⚠ Layer %d: File does not exist: %s\n", task.layer_id, filename.c_str());
-            free(k_copy);
-            free(v_copy);
-            return;
-        }
+        std::string kfile = cache_dir + "/layer_" + std::to_string(task.layer_id) + "_K.bin";
+        std::string vfile = cache_dir + "/layer_" + std::to_string(task.layer_id) + "_V.bin";
 
-        // 🔍 DEBUG: 파일 크기 확인
-        std::error_code ec;
-        auto file_size = std::filesystem::file_size(filename, ec);
-        if (ec) {
-            printf("[KV-SSD] ✗ Cannot get file size for %s: %s\n", filename.c_str(), ec.message().c_str());
+        // K
+        if (!std::filesystem::exists(kfile)) {
+            printf("[KV-SSD] ⚠ Layer %d: K file does not exist: %s\n", task.layer_id, kfile.c_str());
+            free(k_copy);
+            free(v_copy);
+            return;
+        }
+        // V
+        if (!std::filesystem::exists(vfile)) {
+            printf("[KV-SSD] ⚠ Layer %d: V file does not exist: %s\n", task.layer_id, vfile.c_str());
             free(k_copy);
             free(v_copy);
             return;
         }
         
-        size_t expected_size = k_size + v_size;
-        
-        if (file_size != expected_size) {
-            printf("[KV-SSD] ⚠ MISMATCH Layer %d: File=%zu, Expected=%zu (diff=%ld)\n", 
-                   task.layer_id, file_size, expected_size, (long)(file_size - expected_size));
-            // printf("[KV-SSD] ⚠ MISMATCH Layer %d: debug info removed\n", task.layer_id);
-            printf("[KV-SSD] ⚠ MISMATCH Layer %d: current K=%zu, V=%zu\n",
-                   task.layer_id, ggml_nbytes(task.k_tensor), ggml_nbytes(task.v_tensor));
-        }
-        
-        std::ifstream file(filename, std::ios::binary);
-        if (!file.is_open()) {
-            printf("[KV-SSD] ✗ Failed to open layer %d file\n", task.layer_id);
+        std::ifstream fk(kfile, std::ios::binary);
+        std::ifstream fv(vfile, std::ios::binary);
+        if (!fk.is_open() || !fv.is_open()) {
+            printf("[KV-SSD] ✗ Failed to open K/V file for layer %d\n", task.layer_id);
             free(k_copy);
             free(v_copy);
             return;
         }
         
         try {
-            // Read K data
-            
-            file.read(static_cast<char*>(k_copy), k_size);
-            if (file.fail()) {
-                printf("[KV-SSD] ✗ Failed to read K data for layer %d\n", task.layer_id);
-                file.close();
+            std::error_code ec1, ec2;
+            size_t k_file_size = std::filesystem::file_size(kfile, ec1);
+            size_t v_file_size = std::filesystem::file_size(vfile, ec2);
+            size_t k_read = std::min(k_size, k_file_size);
+            size_t v_read = std::min(v_size, v_file_size);
+
+            if (k_read == 0 && v_read == 0) {
+                fk.close(); fv.close();
                 free(k_copy);
                 free(v_copy);
                 return;
             }
             
-            
-            // Read V data
-            file.read(static_cast<char*>(v_copy), v_size);
-            if (file.fail()) {
-                printf("[KV-SSD] ✗ Failed to read V data for layer %d\n", task.layer_id);
-                file.close();
+            if (k_read > 0) {
+                fk.read(static_cast<char*>(k_copy), (std::streamsize)k_read);
+                if (fk.fail()) {
+                    printf("[KV-SSD] ✗ Failed to read K data for layer %d (req=%zu, avail=%zu)\n", task.layer_id, k_size, k_file_size);
+                    fk.close(); fv.close();
+                    free(k_copy);
+                    free(v_copy);
+                    return;
+                }
+            }
+            if (v_read > 0) {
+                fv.read(static_cast<char*>(v_copy), (std::streamsize)v_read);
+                if (fv.fail()) {
+                    printf("[KV-SSD] ✗ Failed to read V data for layer %d (req=%zu, avail=%zu)\n", task.layer_id, v_size, v_file_size);
+                    fk.close(); fv.close();
                 free(k_copy);
                 free(v_copy);
                 return;
+                }
             }
             
-            // === 확인 코드 (이후 제거 예정) ===
-            // bool data_matches = verify_data_integrity(task, k_copy, v_copy, k_size, v_size);
+            // === 확인 코드 ===
+            (void) verify_data_integrity(task, k_copy, v_copy, k_read, v_read);
             
-            
-            // printf("[KV-SSD] 💿 LOAD Layer %d K[0-15]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n", 
-            //        task.layer_id,
-            //        k_loaded_bytes[0], k_loaded_bytes[1], k_loaded_bytes[2], k_loaded_bytes[3],
-            //        k_loaded_bytes[4], k_loaded_bytes[5], k_loaded_bytes[6], k_loaded_bytes[7],
-            //        k_loaded_bytes[8], k_loaded_bytes[9], k_loaded_bytes[10], k_loaded_bytes[11],
-            //        k_loaded_bytes[12], k_loaded_bytes[13], k_loaded_bytes[14], k_loaded_bytes[15]);
-                   
-            // printf("[KV-SSD] 💿 LOAD Layer %d V[0-15]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n", 
-            //        task.layer_id,
-            //        v_loaded_bytes[0], v_loaded_bytes[1], v_loaded_bytes[2], v_loaded_bytes[3],
-            //        v_loaded_bytes[4], v_loaded_bytes[5], v_loaded_bytes[6], v_loaded_bytes[7],
-            //        v_loaded_bytes[8], v_loaded_bytes[9], v_loaded_bytes[10], v_loaded_bytes[11],
-            //        v_loaded_bytes[12], v_loaded_bytes[13], v_loaded_bytes[14], v_loaded_bytes[15]);
-
-            // === SAVE-LOAD 데이터 무결성 검증 ===
-            // verify_save_load_integrity(task.layer_id, k_copy, v_copy, k_size, v_size);
-            
-            ggml_backend_tensor_set(task.k_tensor, k_copy, 0, k_size);
-            ggml_backend_tensor_set(task.v_tensor, v_copy, 0, v_size);
-
-            // printf("[KV-SSD] ✓ Loaded layer %d to GPU (%zu + %zu bytes)\n", 
-            //        task.layer_id, k_size, v_size);
+            ggml_backend_tensor_set(task.k_tensor, k_copy, 0, k_read);
+            ggml_backend_tensor_set(task.v_tensor, v_copy, 0, v_read);
 
             free(k_copy);
             free(v_copy);
 
-            file.close();
+            fk.close();
+            fv.close();
 
         } catch (...) {
             printf("[KV-SSD] ✗ Exception during load for layer %d\n", task.layer_id);
-            file.close();
+            fk.close();
+            fv.close();
         }
     }
 };
@@ -713,7 +607,7 @@ bool llama_kv_offloader_save_layer(
     ggml_tensor* k_tensor,
     ggml_tensor* v_tensor) {
         if (!offloader) return false;
-        return offloader->save_layer(layer_id, k_tensor, v_tensor);
+        return offloader->save_layer(layer_id, k_tensor, v_tensor, 0, 0, 0, 0); // Placeholder for head/n_new
     }
 
 bool llama_kv_offloader_load_layer(
@@ -725,26 +619,17 @@ bool llama_kv_offloader_load_layer(
         return offloader->load_layer(layer_id, k_tensor, v_tensor);
     }
 
-bool llama_kv_offloader_update_load_size(
-    struct llama_kv_offloader* offloader,
-    size_t k_size,
-    size_t v_size) {
-        if (!offloader) return false;
-        return offloader->update_load_size(k_size, v_size);
-    }
-
 // C++ 버전: 벡터 참조 직접 반환
-const std::vector<double>& llama_kv_offloader_get_load_times(struct llama_kv_offloader* offloader) {
-    static std::vector<double> empty_vector;
-    
-    if (!offloader) {
-        return empty_vector;
-    }
-    
-    return offloader->load_times;
-}
 
 } // extern "C"
+
+#ifdef __cplusplus
+const std::vector<double>& llama_kv_offloader_get_load_times(struct llama_kv_offloader* offloader) {
+    static std::vector<double> empty_vector;
+    if (!offloader) return empty_vector;
+    return offloader->load_times;
+}
+#endif
 
 // =============================================================================
 // GGML Backend Scheduler Callback Implementation (ADDED)
@@ -752,122 +637,136 @@ const std::vector<double>& llama_kv_offloader_get_load_times(struct llama_kv_off
 
 extern "C" {
 
-bool llama_kv_ggml_eval_callback(
-    struct ggml_tensor * tensor, 
-    bool ask, 
-    void * user_data) {
-    
-    auto* cb_data = static_cast<llama_kv_callback_data*>(user_data);
-    
-    if (!cb_data || !cb_data->offloader || !tensor || !ask) {
-        return true; // Continue processing
-    }
-    
-    if (tensor->name && std::strstr(tensor->name, "kv_sync") != nullptr) {
-        const char* dash_pos = std::strrchr(tensor->name, '-');
-        if (dash_pos) {
-            int sync_layer_id = std::atoi(dash_pos + 1);
-            if (cb_data->offloader->is_first == 0) { 
+    bool llama_kv_ggml_eval_callback(
+        struct ggml_tensor * tensor, 
+        bool ask, 
+        void * user_data) {
+        bool is_k = false;
+        bool is_v = false;
+        auto* cb_data = static_cast<llama_kv_callback_data*>(user_data);
 
-                // 🎯 해당 layer의 load 완료 확인
-                if (!cb_data->offloader->is_prefetch_complete(sync_layer_id)) {
-                    llama_kv_offloader_wait_loads(cb_data->offloader);
-                }
-                
-            } else if (sync_layer_id == 31) {
-                cb_data->offloader->is_first = 0;
-            }
-        } 
-        
-        return true;
+        if (ask) {
+        if (std::strncmp(tensor->name, "kv_sync", 7) == 0) {
+            cb_data->is_sync = true;
+            return true;
+        } else if (std::strncmp(tensor->name, "k_cache_load", 12) == 0 || std::strncmp(tensor->name, "v_cache_load", 12) == 0) {
+            cb_data->is_load = true;
+            return true;
+        } else if (std::strncmp(tensor->name, "k_cache_save", 12) == 0 || std::strncmp(tensor->name, "v_cache_save", 12) == 0) {
+            cb_data->is_save = true;
+            return true;
+        } else {
+            return false;
+        }
     }
-    
-    if (!tensor->name) {
-        return true; // Continue processing
-    }
-    
-    bool has_next = std::strstr(tensor->name, "_next") != nullptr;
-    
-    // Layer ID 추출 (공통)
-    int layer_id = -1;
-    bool is_k = false, is_v = false;
-    
-    if (has_next) {
-        // load 텐서 처리
+    if (cb_data->is_sync) {
         const char* dash_pos = std::strrchr(tensor->name, '-');
-        if (dash_pos) {
-            layer_id = std::atoi(dash_pos + 1);
+        int layer_id = std::atoi(dash_pos + 1);
+        // printf("[KV-SSD] sync layer %d\n", layer_id);
+        if (cb_data->offloader->is_first == 0) { 
+            if (!cb_data->offloader->is_prefetch_complete(layer_id)) {
+                llama_kv_offloader_wait_loads(cb_data->offloader);
+            }
+        } else if (layer_id == 31) {
+            cb_data->offloader->is_first = 0;
         }
-        is_k = std::strncmp(tensor->name, "k_cache", 7) == 0;
-        is_v = !is_k; 
-    } else {
-        // save 텐서 처리
-        if (std::strncmp(tensor->name, "k_cache-", 8) == 0) {
-            is_k = true;
-            layer_id = std::atoi(tensor->name + 8);
-        } else if (std::strncmp(tensor->name, "v_cache-", 8) == 0) {
-            is_v = true;
-            layer_id = std::atoi(tensor->name + 8);
-        }
-    }
-    
-    if ((is_k || is_v) && layer_id >= 0 && layer_id < 32) {
+        cb_data->is_sync = false;
+        return true;
+    } else if (cb_data->is_load) {
+        const char* dash_pos = std::strrchr(tensor->name, '-');
+        int layer_id = std::atoi(dash_pos + 1);
+        is_k = std::strncmp(tensor->name, "k_cache_load", 12) == 0;
+        is_v = std::strncmp(tensor->name, "v_cache_load", 12) == 0;
         if (is_k) {
             cb_data->k_tensor = tensor;
             cb_data->k_cache_ready = true;
             cb_data->layer_id = layer_id;
-        } else {
+        } else if (is_v) {
             cb_data->v_tensor = tensor;
             cb_data->v_cache_ready = true;
             cb_data->layer_id = layer_id;
         }
-        
-        // K, V 모두 준비되면 실행 (Load 또는 Save)
         if (cb_data->k_cache_ready && cb_data->v_cache_ready) {
-            
-            // Layer 0에서 load size update task 전송 (매번)
-            if (cb_data->layer_id == 0 && has_next) {
-                size_t current_k_size = ggml_nbytes(cb_data->k_tensor);
-                size_t current_v_size = ggml_nbytes(cb_data->v_tensor);
-                
-                // 항상 현재 크기로 update (FIFO 보장으로 모든 load task보다 먼저 처리됨)
-                cb_data->offloader->update_load_size(current_k_size, current_v_size);
+            if (cb_data->offloader->get_pending_loads() > 31) {
+                llama_kv_offloader_wait_loads(cb_data->offloader);
             }
-
-            if (has_next) {
-                // 🔵 Load 실행 
-                if (cb_data->offloader->get_pending_loads() > 31) {
-                    llama_kv_offloader_wait_loads(cb_data->offloader);
-                }
-
-                cb_data->offloader->load_layer(
-                    cb_data->layer_id,
-                    cb_data->k_tensor,
-                    cb_data->v_tensor
-                );
-            } else {
-                // 🟢 Save 실행
-                if (cb_data->offloader->get_pending_saves() > 31) {
-                    llama_kv_offloader_wait_saves(cb_data->offloader);
-                }
-                cb_data->offloader->save_layer(
-                    cb_data->layer_id,
-                    cb_data->k_tensor,
-                    cb_data->v_tensor
-                );
-                llama_kv_offloader_wait_saves(cb_data->offloader);
-            }
-            
-            // Reset (공통)
+            cb_data->offloader->load_layer(
+                cb_data->layer_id,
+                cb_data->k_tensor,
+                cb_data->v_tensor
+            );
+            // printf("[KV-SSD] loading layer %d\n", layer_id);
+            // llama_kv_offloader_wait_loads(cb_data->offloader);
             cb_data->k_tensor = nullptr;
             cb_data->v_tensor = nullptr;
             cb_data->k_cache_ready = cb_data->v_cache_ready = false;
         }
+        cb_data->is_load = false;
+        return true;
+    } else if (cb_data->is_save) {
+        // parse name: k_cache_save-<head>-<n_new>-<layer> or v_cache_save-<head>-<n_new>-<layer>
+        const char* name = tensor->name;
+        is_k = std::strncmp(name, "k_cache_save", 12) == 0;
+        is_v = std::strncmp(name, "v_cache_save", 12) == 0;
+        // layer id is the last dash-suffixed integer
+        const char* last_dash = std::strrchr(name, '-');
+        int layer_id = 0;
+        if (last_dash) {
+            layer_id = std::atoi(last_dash + 1);
+        }
+        // extract head and n_new from the part before last_dash
+        int head = 0, n_new = 0;
+        if (last_dash) {
+            // copy prefix into buffer
+            size_t prefix_len = (size_t)(last_dash - name);
+            char buf[128];
+            if (prefix_len >= sizeof(buf)) prefix_len = sizeof(buf) - 1;
+            std::memcpy(buf, name, prefix_len);
+            buf[prefix_len] = '\0';
+            const char* p1 = std::strchr(buf, '-'); // after k_cache_save
+            if (p1) {
+                head = std::atoi(p1 + 1);
+                const char* p2 = std::strchr(p1 + 1, '-');
+                if (p2) n_new = std::atoi(p2 + 1);
+            }
+        }
+        if (is_k) {
+            cb_data->k_tensor = tensor;
+            cb_data->k_cache_ready = true;
+            cb_data->layer_id = layer_id;
+            cb_data->k_head = head;
+            cb_data->k_n_new = n_new;
+        } else if (is_v) {
+            cb_data->v_tensor = tensor;
+            cb_data->v_cache_ready = true;
+            cb_data->layer_id = layer_id;
+            cb_data->v_head = head;
+            cb_data->v_n_new = n_new;
+        }
+        if (cb_data->k_cache_ready && cb_data->v_cache_ready) {
+            if (cb_data->offloader->get_pending_saves() > 31) {
+                llama_kv_offloader_wait_saves(cb_data->offloader);
+            }
+            cb_data->offloader->save_layer(
+                cb_data->layer_id,
+                cb_data->k_tensor,
+                cb_data->v_tensor,
+                cb_data->k_head,
+                cb_data->k_n_new,
+                cb_data->v_head,
+                cb_data->v_n_new
+            );
+            // llama_kv_offloader_wait_saves(cb_data->offloader);
+            // printf("[KV-SSD] saving layer %d\n", layer_id);
+            cb_data->k_tensor = nullptr;
+            cb_data->v_tensor = nullptr;
+            cb_data->k_cache_ready = cb_data->v_cache_ready = false;
+        }
+        cb_data->is_save = false;
+        return true;
+    }
     }
     
-    return true;
-}
-
 
 
 } // extern "C"

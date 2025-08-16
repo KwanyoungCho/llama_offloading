@@ -2355,3 +2355,7 @@ uint32_t llama_kv_cache_unified::get_padding(const llama_cparams & cparams) {
     // the FA kernels require padding to avoid extra runtime boundary checks
     return cparams.flash_attn ? 256u : 32u;
 }
+
+int32_t llama_kv_cache_unified_state::get_head() const {
+    return head;
+}
